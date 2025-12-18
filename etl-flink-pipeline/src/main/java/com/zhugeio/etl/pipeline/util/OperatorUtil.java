@@ -4,6 +4,7 @@ import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import org.apache.commons.lang3.StringUtils;
 
+import java.text.ParseException;
 import java.time.LocalDate;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -18,11 +19,64 @@ public class OperatorUtil {
     /**
      * 判断属性是否满足条件
      */
-    public static boolean compareProValue(Integer appId, Integer zgId, Map<String, Object> props, JSONObject matchJson, Integer zgDid) {
+    public static boolean compareProValue(Integer appId, Integer zgId, Map<String, Object> props, JSONObject matchJson, Integer zgDid) throws ParseException {
 
         String propCategory = matchJson.getString("propCategory");// 属性类型
 
+        if ("userProp".equals(propCategory)) {
+            //用户属性条件限制
+            Integer attrId = matchJson.getInteger("attrId");
 
+            if (attrId == 0) {
+                // 无用户属性id 从 f_user_detail_177 或 f_user_detail_sum_177 获取属性值
+                String columName = matchJson.getString("dimensionSub");
+                switch (columName) {
+                    case "visit_times":
+                    case "duration":
+                        String sql1 = String.format("select %s from f_user_detail_sum_%s where zg_id= %s limit 1", columName, appId, zgId);
+                        String ssdbKey1 = String.format("ad:user:col:%s:%s:%s", appId, zgId, columName);
+                        String value1 = getUserFeildValue(ssdbKey1, sql1, columName);
+                        if (StringUtils.isNotEmpty(value1)) {
+                            System.out.println("用户属性查询sql： " + sql1 + "\n 查询结果：" + value1);
+                            return compareValue(value1, matchJson);
+                        }
+                        break;
+                    case "is_anonymous":
+                        //实名匿名判断
+                        String sql0 = String.format("select user_id from  b_user_%s where device_id=%s and zg_id=%s limit 1", appId, zgDid, zgId);
+                        String ssdbKey0 = String.format("ad:user:col:%s:%s:%s", appId, zgId, "uid");
+                        String value0 = getUserFeildValue(ssdbKey0, sql0, "user_id");
+                        if (StringUtils.isEmpty(value0) || "NULL".equalsIgnoreCase(value0)) {
+                            value0 = "匿名";
+                        } else {
+                            value0 = "实名";
+                        }
+                        if (StringUtils.isNotEmpty(value0)) {
+                            System.out.println("用户属性查询sql： " + sql0 + "\n 查询结果：" + value0);
+                            return compareValue(value0, matchJson);
+                        }
+                        break;
+                    default:
+                        String sql2 = String.format("select %s from f_user_detail_%s where zg_id= %s limit 1", columName, appId, zgId);
+                        String ssdbKey2 = String.format("ad:user:col:%s:%s:%s", appId, zgId, columName);
+                        String value2 = getUserFeildValue(ssdbKey2, sql2, columName);
+                        if (StringUtils.isNotEmpty(value2)) {
+                            System.out.println("用户属性查询sql： " + sql2 + "\n 查询结果：" + value2);
+                            return compareValue(value2, matchJson);
+                        }
+                        break;
+                }
+            } else {
+                //有用户属性id 从 用户属性表获取 b_user_property_177 属性值
+                String sql3 = String.format("select property_value from b_user_property_%s where property_id = %s and zg_id = %s limit 1", appId, attrId, zgId);
+                String ssdbKey3 = String.format("ad:user:id:%s:%s:%s", appId, zgId, attrId);
+                String value3 = getUserFeildValue(ssdbKey3, sql3, "property_value");
+                if (StringUtils.isNotEmpty(value3)) {
+                    System.out.println("用户属性查询sql： " + sql3 + "\n 查询结果：" + value3);
+                    return compareValue(value3, matchJson);
+                }
+            }
+        }
         if ("eventProp".equals(propCategory)) {
             //事件属性条件限制
             //{"attrId":5560,"propCategory":"eventProp","values":["100"],"dimensionSub":"event_attr","label":"商品价格","type":2,"operator":"gt","attrName":"商品价格"}
@@ -95,6 +149,10 @@ public class OperatorUtil {
                 return compareDateValue(eventAttValue, values, operator);
             }
         } else {
+            if ("".equals(eventAttValue)) {
+                // 保留原有逻辑，但为空的处理
+            }
+            //空值处理
             return handleNullValue(eventAttValue, operator);
         }
         return false;
@@ -255,7 +313,21 @@ public class OperatorUtil {
         return value == null || "null".equalsIgnoreCase(value) || StringUtils.isEmpty(value);
     }
 
-
+    /**
+     * 从impala查询用户属性字段：先从ssdb获取，没有再查impala
+     */
+    public static String getUserFeildValue(String ssdbKey, String sql, String columName) {
+//        String value = AdRedisClient.getStr(ssdbKey);
+//        if (StringUtils.isEmpty(value)) {
+//            value = ImpalaDao.querySQLForOne(sql, columName);
+//            if (!StringUtils.isEmpty(value)) {
+//                //查询到结果则缓存于ssdb，缓存6小时
+//                AdRedisClient.setStr(ssdbKey, value, 6 * 60 * 60);
+//            }
+//        }
+//        return value;
+        return null;
+    }
 
     public static boolean isMatch(Pattern pattern, String text) {
         Matcher matcher = pattern.matcher(text);

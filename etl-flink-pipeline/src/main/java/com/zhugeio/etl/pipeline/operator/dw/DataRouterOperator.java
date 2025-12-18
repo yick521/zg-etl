@@ -1,11 +1,13 @@
 package com.zhugeio.etl.pipeline.operator.dw;
 
+import com.zhugeio.etl.common.cache.CacheConfig;
+import com.zhugeio.etl.common.cache.ConfigCacheService;
 import com.zhugeio.etl.common.metrics.OperatorMetrics;
 import com.zhugeio.etl.common.model.DeviceRow;
 import com.zhugeio.etl.common.model.EventAttrRow;
 import com.zhugeio.etl.common.model.UserPropertyRow;
 import com.zhugeio.etl.common.model.UserRow;
-import com.zhugeio.etl.pipeline.config.Config;
+import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.pipeline.dataquality.DataQualityContext;
 import com.zhugeio.etl.pipeline.dataquality.DataQualityKafkaService;
 import com.zhugeio.etl.pipeline.dataquality.DataValidator;
@@ -21,6 +23,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -67,7 +70,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
     private transient EventAttrTransfer eventAttrTransfer;
 
     // 服务
-    private transient EventAttrColumnService columnService;
+    private transient ConfigCacheService configCacheService;
     private transient BaiduKeywordService keywordService;
 
     // 数据质量
@@ -105,18 +108,17 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
             whiteAppIds.addAll(Arrays.asList(whiteAppsStr.split(",")));
         }
 
-        // CDP 应用 (TODO: 从配置或数据库加载)
-        cdpAppIds = new HashSet<>();
 
-        // 初始化列映射服务
-        columnService = new EventAttrColumnService(
-                Config.getString(Config.KVROCKS_HOST, "localhost"),
-                Config.getInt(Config.KVROCKS_PORT, 6379),
-                Config.getBoolean(Config.KVROCKS_CLUSTER, false),
-                Config.getInt(Config.KVROCKS_LOCAL_CACHE_SIZE, 10000),
-                Config.getInt(Config.KVROCKS_LOCAL_CACHE_EXPIRE_MINUTES, 60)
+        configCacheService = new ConfigCacheService(
+                CacheConfig.builder()
+                        .kvrocksCluster(Config.getBoolean(Config.KVROCKS_CLUSTER, true))
+                        .kvrocksHost(Config.getString(Config.KVROCKS_HOST, "localhost"))
+                        .kvrocksTimeout(Config.getInt(Config.KVROCKS_PORT, 6379))
+                        .appCacheSize(Config.getInt(Config.KVROCKS_LOCAL_CACHE_SIZE, 10000))
+                        .eventCacheSize(Config.getInt(Config.KVROCKS_LOCAL_CACHE_EXPIRE_MINUTES, 60))
+                        .build()
         );
-        columnService.init();
+        configCacheService.init();
 
         // 初始化百度关键词服务
         keywordService = new BaiduKeywordService(
@@ -134,14 +136,12 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
         // 初始化转换器
         userTransfer = new UserTransfer();
         deviceTransfer = new DeviceTransfer();
-
-        userPropertyTransfer = new UserPropertyTransfer();
-        userPropertyTransfer.setCdpAppIds(cdpAppIds);
+        userPropertyTransfer = new UserPropertyTransfer(configCacheService);
 
         int expireSubDays = Config.getInt(Config.TIME_EXPIRE_SUBDAYS, 7);
         int expireAddDays = Config.getInt(Config.TIME_EXPIRE_ADDDAYS, 1);
         int eventAttrLengthLimit = Config.getInt(Config.EVENT_ATTR_LENGTH_LIMIT, 256);
-        eventAttrTransfer = new EventAttrTransfer(columnService, expireSubDays, expireAddDays, eventAttrLengthLimit);
+        eventAttrTransfer = new EventAttrTransfer(configCacheService, expireSubDays, expireAddDays, eventAttrLengthLimit);
 
         // 初始化数据质量校验器
         dataQualityEnabled = Config.getBoolean(Config.DQ_ENABLED, true);
@@ -161,6 +161,8 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
         metrics.in();
 
         try {
+            configCacheService.checkAndRefreshVersion();
+
             // 直接从 ZGMessage 获取数据
             Map<String, Object> msgData = message.getData();
             if (msgData == null) {
@@ -314,7 +316,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
                                   Integer appId, Integer platform, Map<String, Object> pr,
                                   String ip, String[] ipResult, String ua, Map<String, String> uaResult,
                                   String business, Map<String, String> eqidKeywords,
-                                  Long msgSt, String deviceMd5, String sdk, String pl, String rawJson) {
+                                  Long msgSt, String deviceMd5, String sdk, String pl, String rawJson) throws ExecutionException, InterruptedException {
 
         switch (dt) {
             case "zgid":
@@ -370,7 +372,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
                                   Integer appId, Integer platform, Map<String, Object> pr,
                                   String ip, String[] ipResult, String ua, Map<String, String> uaResult,
                                   String business, Map<String, String> eqidKeywords,
-                                  String sdk, String pl, String rawJson) {
+                                  String sdk, String pl, String rawJson) throws ExecutionException, InterruptedException {
 
         // 提取校验所需字段
         String zgZgid = getStringValue(pr, "$zg_zgid");
@@ -545,9 +547,7 @@ public class DataRouterOperator extends ProcessFunction<ZGMessage, EventAttrRow>
                 userCount.get(), deviceCount.get(), userPropertyCount.get(),
                 eventAttrCount.get(), unknownCount.get(), errorCount.get(), blacklistedCount.get());
 
-        if (columnService != null) {
-            columnService.close();
-        }
+        configCacheService.close();
 
         if (keywordService != null) {
             keywordService.close();

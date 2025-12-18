@@ -6,7 +6,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.zhugeio.etl.common.client.kvrocks.KvrocksClient;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
-import com.zhugeio.etl.pipeline.util.SnowflakeIdGenerator;
+import com.zhugeio.etl.common.util.SnowflakeIdGenerator;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;

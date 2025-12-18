@@ -1,5 +1,6 @@
 package com.zhugeio.etl.pipeline.transfer;
 
+import com.zhugeio.etl.common.cache.ConfigCacheService;
 import com.zhugeio.etl.common.model.EventAttrRow;
 import com.zhugeio.etl.pipeline.service.EventAttrColumnService;
 import org.slf4j.Logger;
@@ -9,6 +10,7 @@ import java.io.Serializable;
 import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 
 /**
  * 事件属性转换器
@@ -34,7 +36,7 @@ public class EventAttrTransfer implements Serializable {
     
     private final int expireSubDays;
     private final int expireAddDays;
-    private final EventAttrColumnService columnService;
+    private final ConfigCacheService configCacheService;
     private final int eventAttrLengthLimit;
     
     private Set<String> mktAttrs;
@@ -47,8 +49,8 @@ public class EventAttrTransfer implements Serializable {
     private static final ThreadLocal<SimpleDateFormat> YEAR_WEEK_FORMAT = 
             ThreadLocal.withInitial(() -> new SimpleDateFormat("YYYYww"));
     
-    public EventAttrTransfer(EventAttrColumnService columnService, int expireSubDays, int expireAddDays, int eventAttrLengthLimit) {
-        this.columnService = columnService;
+    public EventAttrTransfer(ConfigCacheService configCacheService, int expireSubDays, int expireAddDays, int eventAttrLengthLimit) {
+        this.configCacheService = configCacheService;
         this.expireSubDays = expireSubDays;
         this.expireAddDays = expireAddDays;
         this.eventAttrLengthLimit = eventAttrLengthLimit;
@@ -69,7 +71,7 @@ public class EventAttrTransfer implements Serializable {
      */
     public EventAttrRow transferFromMap(Integer appId, Integer platform, String dt, Map<String, Object> pr,
                                   String ip, String[] ipResult, String ua, Map<String, String> uaResult,
-                                  String business, Map<String, String> eqidKeywords) {
+                                  String business, Map<String, String> eqidKeywords) throws ExecutionException, InterruptedException {
         
         String zgId = getStringValue(pr, "$zg_zgid");
         String zgEid = getStringValue(pr, "$zg_eid");
@@ -242,36 +244,33 @@ public class EventAttrTransfer implements Serializable {
         row.setAttr4(NULL_VALUE);
         row.setAttr5(getStringValue(pr, "$zg_zgid") + "_" + getStringValue(pr, "$zg_sid"));
     }
-    
-    private void fillCustomPropertiesFromMap(EventAttrRow row, Map<String, Object> pr, String dt, String zgEid) {
+
+    private void fillCustomPropertiesFromMap(EventAttrRow row, Map<String, Object> pr, String dt, String zgEid) throws ExecutionException, InterruptedException {
         Set<String> attrSet = getAttrSet(dt);
-        
+
         for (String key : pr.keySet()) {
             boolean isCustomProp = false;
-            
-            // evt 类型: 以 "_" 开头的属性
+
             if ("evt".equals(dt) && key.startsWith("_")) {
                 isCustomProp = true;
-            } 
-            // mkt/abp 类型: 不以 "$" 开头，且不在排除集合中的属性
-            else if (("mkt".equals(dt) || "abp".equals(dt)) && !key.startsWith("$") && !attrSet.contains(key.replace("$", ""))) {
+            } else if (("mkt".equals(dt) || "abp".equals(dt)) && !key.startsWith("$")
+                    && !attrSet.contains(key.replace("$", ""))) {
                 isCustomProp = true;
             }
-            
+
             if (isCustomProp) {
-                // 使用 $zg_epid# 获取属性ID (与Scala一致)
                 String propIdKey = "$zg_epid#" + key;
                 String propId = getStringValue(pr, propIdKey);
-                
+
                 if (!isNullOrEmpty(propId)) {
-                    // 获取列索引 (1-100)
-                    int colIndex = columnService.getColumnIndex(zgEid, propId);
+                    // ========== 改造: 使用 configCacheService ==========
+                    // 原来: int colIndex = columnService.getColumnIndex(zgEid, propId);
+                    int colIndex = configCacheService.getEventAttrColumnIndex(zgEid, propId).get().intValue();
+
                     if (colIndex >= 1 && colIndex <= 100) {
-                        // 设置属性值
                         String propValue = ensureLength(getStringValue(pr, key), eventAttrLengthLimit);
                         row.setCustomProperty(colIndex, propValue);
-                        
-                        // 设置属性类型 (使用 $zg_eptp#)
+
                         String propTypeKey = "$zg_eptp#" + key;
                         String propType = ensureLength(getStringValue(pr, propTypeKey), 256);
                         row.setPropertyType(colIndex, propType);

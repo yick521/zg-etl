@@ -8,9 +8,9 @@ import cn.hutool.crypto.asymmetric.KeyType;
 import cn.hutool.crypto.asymmetric.SM2;
 import cn.hutool.crypto.symmetric.SymmetricCrypto;
 
-import com.zhugeio.etl.pipeline.config.Config;
+import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.pipeline.exceptions.ResolveException;
-import com.zhugeio.etl.pipeline.util.SecretUtils;
+import com.zhugeio.etl.common.util.SecretUtils;
 import com.zhugeio.tool.commons.JsonUtil;
 import com.zhugeio.tool.commons.ZlibUtil;
 

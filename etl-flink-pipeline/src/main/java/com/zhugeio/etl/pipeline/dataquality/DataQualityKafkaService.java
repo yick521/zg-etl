@@ -14,7 +14,7 @@ import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
-import com.zhugeio.etl.pipeline.config.Config;
+import com.zhugeio.etl.common.config.Config;
 
 /**
  * 数据质量 Kafka 服务

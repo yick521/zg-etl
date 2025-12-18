@@ -33,12 +33,15 @@ public class ZGMessage implements Serializable {
     private Integer errorCode = 0;
     private String errorDescribe = "";
     private String business = "";
-
+    private Integer zgEid = 0;
     // 数据质量需要的输出，侧输出分流使用
     private JSONObject dataQuality;
     private JSONObject dataQualityError;
     // 广告输出kafka信息
     private List<String> advKafkaMsgList;
+
+    // 广告输出kafka信息 - ad_user
+    private List<String> advUserKafkaMsgList;
 
     public ZGMessage() {
     }
@@ -68,6 +71,14 @@ public class ZGMessage implements Serializable {
 
     public void setAdvKafkaMsgList(List<String> advKafkaMsgList) {
         this.advKafkaMsgList = advKafkaMsgList;
+    }
+
+    public List<String> getAdvUserKafkaMsgList() {
+        return advUserKafkaMsgList;
+    }
+
+    public void setAdvUserKafkaMsgList(List<String> advUserKafkaMsgList) {
+        this.advUserKafkaMsgList = advUserKafkaMsgList;
     }
 
     public JSONObject getDataQualityError() {
@@ -214,7 +225,13 @@ public class ZGMessage implements Serializable {
         this.business = business;
     }
 
+    public Integer getZgEid() {
+        return zgEid;
+    }
 
+    public void setZgEid(Integer zgEid) {
+        this.zgEid = zgEid;
+    }
 
     @Override
     public boolean equals(Object o) {

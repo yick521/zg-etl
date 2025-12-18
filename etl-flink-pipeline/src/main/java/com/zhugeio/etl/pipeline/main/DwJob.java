@@ -9,7 +9,7 @@ import com.zhugeio.etl.common.model.UserRow;
 import com.zhugeio.etl.common.sink.CommitSuccessCallback;
 import com.zhugeio.etl.common.sink.DorisSinkBuilder;
 import com.zhugeio.etl.common.sink.JsonSerializerFactory;
-import com.zhugeio.etl.pipeline.config.Config;
+import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.pipeline.dataquality.DataQualityKafkaService;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.kafka.ZGMsgSchema;

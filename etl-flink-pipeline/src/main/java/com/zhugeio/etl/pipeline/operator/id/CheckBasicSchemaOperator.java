@@ -2,7 +2,7 @@ package com.zhugeio.etl.pipeline.operator.id;
 
 import com.zhugeio.etl.pipeline.enums.ErrorMessageEnum;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
-import com.zhugeio.etl.pipeline.util.Check;
+import com.zhugeio.etl.common.util.Check;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;

@@ -2,7 +2,7 @@ package com.zhugeio.etl.pipeline.operator.id.virtualAttribute;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.zhugeio.etl.pipeline.util.DateTimeResult;
+import com.zhugeio.etl.common.util.DateTimeResult;
 
 
 import java.math.BigDecimal;

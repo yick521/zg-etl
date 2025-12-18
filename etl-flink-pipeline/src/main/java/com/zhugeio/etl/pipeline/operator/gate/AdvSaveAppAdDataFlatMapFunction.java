@@ -7,7 +7,7 @@ import com.zhugeio.etl.common.client.redis.RedisClient;
 import com.zhugeio.etl.pipeline.entity.AdvMessage;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.exceptions.BusinessTableReadException;
-import com.zhugeio.etl.pipeline.util.ToolUtil;
+import com.zhugeio.etl.common.util.ToolUtil;
 import com.zhugeio.tool.commons.JsonUtil;
 import io.lettuce.core.KeyValue;
 import org.apache.commons.lang3.StringUtils;

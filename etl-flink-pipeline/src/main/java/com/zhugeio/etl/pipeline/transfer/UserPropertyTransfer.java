@@ -1,5 +1,6 @@
 package com.zhugeio.etl.pipeline.transfer;
 
+import com.zhugeio.etl.common.cache.ConfigCacheService;
 import com.zhugeio.etl.common.model.UserPropertyRow;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 
 /**
  * 用户属性转换器
@@ -28,22 +30,21 @@ public class UserPropertyTransfer implements Serializable {
     private static final String APP_USER_ID_PROPERTY_ID = "-1";
     private static final String APP_USER_ID_PROPERTY_NAME = "app_user_id";
     private static final String APP_USER_ID_DATA_TYPE = "string";
-    
-    private Set<Integer> cdpAppIds;
+
+    private final ConfigCacheService configCacheService;
     
     private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT = 
             ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
-    
-    public UserPropertyTransfer() {}
-    
-    public void setCdpAppIds(Set<Integer> cdpAppIds) {
-        this.cdpAppIds = cdpAppIds;
+
+    public UserPropertyTransfer(ConfigCacheService configCacheService) {
+        this.configCacheService = configCacheService;
     }
+
     
     /**
      * 转换用户属性数据 (从 Map)
      */
-    public List<UserPropertyRow> transferFromMap(Integer appId, Integer platform, Map<String, Object> pr) {
+    public List<UserPropertyRow> transferFromMap(Integer appId, Integer platform, Map<String, Object> pr) throws ExecutionException, InterruptedException {
         List<UserPropertyRow> result = new ArrayList<>();
         
         if (pr == null || appId == null) {
@@ -70,7 +71,7 @@ public class UserPropertyTransfer implements Serializable {
         }
         
         long timestamp = Timestamp.valueOf(time).getTime() / 1000;
-        boolean cdpMode = cdpAppIds != null && cdpAppIds.contains(appId);
+        boolean cdpMode = isCdpEnabled(appId);
         
         // 处理自定义属性 (以 "_" 开头)
         for (String key : pr.keySet()) {
@@ -92,6 +93,16 @@ public class UserPropertyTransfer implements Serializable {
         }
         
         return result;
+    }
+
+    /**
+     * 检查应用是否开启 CDP - 改造新增
+     */
+    private boolean isCdpEnabled(Integer appId) throws ExecutionException, InterruptedException {
+        if (configCacheService == null) {
+            return false;
+        }
+        return configCacheService.isCdpEnabled(appId).get();
     }
     
     private UserPropertyRow processCustomPropertyFromMap(Integer appId, Integer platform, Map<String, Object> pr,

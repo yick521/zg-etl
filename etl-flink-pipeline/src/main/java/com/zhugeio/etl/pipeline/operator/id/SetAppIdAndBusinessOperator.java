@@ -9,7 +9,7 @@ import com.zhugeio.etl.pipeline.enums.ErrorMessageEnum;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.model.App;
 import com.zhugeio.etl.pipeline.model.CompanyApp;
-import com.zhugeio.etl.pipeline.util.Dims;
+import com.zhugeio.etl.common.util.Dims;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;

@@ -158,6 +158,37 @@ public class KvrocksClient implements Serializable {
     }
 
     /**
+     * ✅ 异步 SETEX (带过期时间的SET)
+     */
+    public CompletableFuture<Void> asyncSetEx(String key, long seconds, String value) {
+        try {
+            if (isCluster) {
+                RedisAdvancedClusterAsyncCommands<String, String> async =
+                        clusterConnection.async();
+                return async.setex(key, seconds, value)
+                        .toCompletableFuture()
+                        .thenApply(result -> (Void) null)
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SETEX失败: {}, {}", key, ex.getMessage());
+                            return null;
+                        });
+            } else {
+                RedisAsyncCommands<String, String> async =
+                        standaloneConnection.async();
+                return async.setex(key, seconds, value)
+                        .toCompletableFuture()
+                        .thenApply(result -> (Void) null)
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SETEX失败: {}, {}", key, ex.getMessage());
+                            return null;
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    /**
      * ✅ 原子性的 SETNX (SET if Not eXists)
      * 只在key不存在时设置值
      *
@@ -545,6 +576,83 @@ public class KvrocksClient implements Serializable {
 
         } catch (Exception e) {
             LOG.error("批量写入失败: {}, {}", hashKey, e.getMessage());
+        }
+    }
+
+    // ==================== Set 操作 ====================
+
+    /**
+     * ✅ 异步 SISMEMBER (检查成员是否在集合中)
+     */
+    public CompletableFuture<Boolean> asyncSIsMember(String key, String member) {
+        try {
+            if (isCluster) {
+                return clusterConnection.async().sismember(key, member)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SISMEMBER失败: {}:{}, {}", key, member, ex.getMessage());
+                            return false;
+                        });
+            } else {
+                return standaloneConnection.async().sismember(key, member)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SISMEMBER失败: {}:{}, {}", key, member, ex.getMessage());
+                            return false;
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(false);
+        }
+    }
+
+    /**
+     * ✅ 异步 SADD (添加成员到集合)
+     */
+    public CompletableFuture<Long> asyncSAdd(String key, String... members) {
+        try {
+            if (isCluster) {
+                return clusterConnection.async().sadd(key, members)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SADD失败: {}, {}", key, ex.getMessage());
+                            return 0L;
+                        });
+            } else {
+                return standaloneConnection.async().sadd(key, members)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SADD失败: {}, {}", key, ex.getMessage());
+                            return 0L;
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(0L);
+        }
+    }
+
+    /**
+     * ✅ 异步 SMEMBERS (获取集合所有成员)
+     */
+    public CompletableFuture<Set<String>> asyncSMembers(String key) {
+        try {
+            if (isCluster) {
+                return clusterConnection.async().smembers(key)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SMEMBERS失败: {}, {}", key, ex.getMessage());
+                            return Collections.emptySet();
+                        });
+            } else {
+                return standaloneConnection.async().smembers(key)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks SMEMBERS失败: {}, {}", key, ex.getMessage());
+                            return Collections.emptySet();
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(Collections.emptySet());
         }
     }
 

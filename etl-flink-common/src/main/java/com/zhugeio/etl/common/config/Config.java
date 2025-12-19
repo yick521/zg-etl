@@ -111,6 +111,11 @@ public class Config {
     public static final String OPERATOR_UA_CACHE_SIZE = "operator.ua.cache.size";
     public static final String OPERATOR_UA_CACHE_EXPIRE_MINUTES = "operator.ua.cache.expire.minutes";
 
+
+    // idmapping配置常量
+    public static final String KAFKA_ID_MAPPING_TOPIC = "kafka.id.mapping.topic";
+    public static final String KAFKA_ID_MAPPING_GROUP_ID = "kafka.id.mapping.group.id";
+    public static final String CHECKPOINT_ID_MAPPING_PATH = "checkpoint.id.mapping.path";
     /**
      * 数据质量服务开关
      * 对应 Scala: 无直接对应，默认开启

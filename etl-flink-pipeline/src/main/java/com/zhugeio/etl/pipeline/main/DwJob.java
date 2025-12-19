@@ -1,7 +1,7 @@
 package com.zhugeio.etl.pipeline.main;
 
+import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.common.config.FlinkEnvConfig;
-import com.zhugeio.etl.common.source.KafkaSourceBuilder;
 import com.zhugeio.etl.common.model.DeviceRow;
 import com.zhugeio.etl.common.model.EventAttrRow;
 import com.zhugeio.etl.common.model.UserPropertyRow;
@@ -9,14 +9,11 @@ import com.zhugeio.etl.common.model.UserRow;
 import com.zhugeio.etl.common.sink.CommitSuccessCallback;
 import com.zhugeio.etl.common.sink.DorisSinkBuilder;
 import com.zhugeio.etl.common.sink.JsonSerializerFactory;
-import com.zhugeio.etl.common.config.Config;
+import com.zhugeio.etl.common.source.KafkaSourceBuilder;
 import com.zhugeio.etl.pipeline.dataquality.DataQualityKafkaService;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.kafka.ZGMsgSchema;
-import com.zhugeio.etl.pipeline.operator.dw.DataRouterOperator;
-import com.zhugeio.etl.pipeline.operator.dw.IpEnrichOperator;
-import com.zhugeio.etl.pipeline.operator.dw.SearchKeywordEnrichOperator;
-import com.zhugeio.etl.pipeline.operator.dw.UserAgentEnrichOperator;
+import com.zhugeio.etl.pipeline.operator.dw.*;
 import org.apache.doris.flink.sink.writer.serializer.DorisRecordSerializer;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.streaming.api.datastream.AsyncDataStream;
@@ -38,7 +35,7 @@ public class DwJob {
     private static final String CHECKPOINT_BASE = "hdfs:///user/flink/checkpoints/";
 
     public static void main(String[] args) throws Exception {
-        LOG.info("DW ETL Pipeline 启动...");
+        LOG.info("DW ETL Pipeline (Async) 启动...");
 
         // 1. 环境配置
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -53,30 +50,68 @@ public class DwJob {
                         .brokers(Config.getString(Config.KAFKA_BROKERS))
                         .topic(Config.getString(Config.KAFKA_DW_SOURCE_TOPIC))
                         .groupId(Config.getString(Config.KAFKA_DW_GROUP_ID))
-                        .consumerProps(Config.getKafkaConsumerProps())  // 从配置文件读取
+                        .consumerProps(Config.getKafkaConsumerProps())
                         .deserializer(new ZGMsgSchema())
                         .build(),
                 WatermarkStrategy.noWatermarks(),
                 "KafkaSource"
         ).uid("kafka-source");
 
-        // 3. 富化 (三个独立算子，各自可配置并行度/超时/容量)
+        // 3. 富化
         DataStream<ZGMessage> enriched = buildEnrichmentPipeline(source);
 
-        // 4. 路由分流
-        SingleOutputStreamOperator<EventAttrRow> routed = enriched
-                .process(new DataRouterOperator())
-                .name("DataRouter").uid("data-router");
+        // 4. ✅ 异步路由 + 解包
+        SingleOutputStreamOperator<EventAttrRow> routed = buildAsyncRouterPipeline(enriched);
 
         // 5. Sink
         addDorisSinks(routed);
 
         // 6. 执行
-        env.execute("DW-ETL-Pipeline");
+        env.execute("DW-ETL-Pipeline-Async");
     }
 
     /**
-     * 构建富化流水线 (三个独立算子)
+     * ✅ 异步路由流水线
+     */
+    private static SingleOutputStreamOperator<EventAttrRow> buildAsyncRouterPipeline(DataStream<ZGMessage> enriched) {
+        
+        // Step 1: 异步路由
+        DataStream<RouterOutput> routerOutput = AsyncDataStream.unorderedWait(
+                enriched,
+                new DataRouterOperator(
+                        Config.getString(Config.KVROCKS_HOST, "localhost"),
+                        Config.getInt(Config.KVROCKS_PORT, 6379),
+                        Config.getBoolean(Config.KVROCKS_CLUSTER, false),
+                        Config.getInt(Config.KVROCKS_LOCAL_CACHE_SIZE, 10000),
+                        Config.getInt(Config.KVROCKS_LOCAL_CACHE_EXPIRE_MINUTES, 60),
+                        Config.getString(Config.BLACK_APPIDS, "-1"),
+                        Config.getString(Config.WHITE_APPID, ""),
+                        Config.getInt(Config.TIME_EXPIRE_SUBDAYS, 7),
+                        Config.getInt(Config.TIME_EXPIRE_ADDDAYS, 1),
+                        Config.getInt(Config.EVENT_ATTR_LENGTH_LIMIT, 256),
+                        Config.getBoolean(Config.DQ_ENABLED, true),
+                        Config.getString(Config.BAIDU_URL, ""),
+                        Config.getString(Config.BAIDU_ID, ""),
+                        Config.getString(Config.BAIDU_KEY, ""),
+                        Config.getString(Config.REDIS_HOST, "localhost"),
+                        Config.getInt(Config.REDIS_PORT, 6379),
+                        Config.getBoolean(Config.REDIS_CLUSTER, false),
+                        Config.getInt(Config.REQUEST_SOCKET_TIMEOUT, 5),
+                        Config.getInt(Config.REQUEST_CONNECT_TIMEOUT, 5)
+                ),
+                Config.getLong(Config.OPERATOR_KEYWORD_TIMEOUT_MS, 5000L),
+                TimeUnit.MILLISECONDS,
+                Config.getInt(Config.OPERATOR_KEYWORD_CAPACITY, 100)
+        ).name("DataRouterAsync").uid("data-router-async");
+        
+        // Step 2: 解包分流
+        return routerOutput
+                .process(new RouterOutputUnpacker())
+                .name("RouterUnpacker").uid("router-unpacker");
+    }
+
+    /**
+     * 构建富化流水线 (与原版相同)
      */
     private static DataStream<ZGMessage> buildEnrichmentPipeline(DataStream<ZGMessage> input) {
         // IP 富化
@@ -130,12 +165,13 @@ public class DwJob {
     }
 
     /**
-     * 添加所有 Doris Sink
+     * 添加所有 Doris Sink (使用新的侧输出标签)
      */
     private static void addDorisSinks(SingleOutputStreamOperator<EventAttrRow> routed) {
-        DataStream<UserRow> userStream = routed.getSideOutput(DataRouterOperator.USER_OUTPUT);
-        DataStream<DeviceRow> deviceStream = routed.getSideOutput(DataRouterOperator.DEVICE_OUTPUT);
-        DataStream<UserPropertyRow> userPropStream = routed.getSideOutput(DataRouterOperator.USER_PROPERTY_OUTPUT);
+        // ✅ 使用 RouterOutputUnpacker 的侧输出标签
+        DataStream<UserRow> userStream = routed.getSideOutput(RouterOutputUnpacker.USER_OUTPUT);
+        DataStream<DeviceRow> deviceStream = routed.getSideOutput(RouterOutputUnpacker.DEVICE_OUTPUT);
+        DataStream<UserPropertyRow> userPropStream = routed.getSideOutput(RouterOutputUnpacker.USER_PROPERTY_OUTPUT);
 
         String feNodes = Config.getString(Config.DORIS_FE_NODES);
         String database = Config.getString(Config.DORIS_DATABASE, "dwd");
@@ -173,7 +209,7 @@ public class DwJob {
                 .highThroughput().serializer(eventSerializer).onSuccess(callback)
                 .addTo(routed);
 
-        LOG.info("Doris Sink 配置完成");
+        LOG.info("Doris Sink 配置完成 (Async版)");
     }
 
     private static CommitSuccessCallback createCallback() {

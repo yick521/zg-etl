@@ -11,15 +11,13 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
 
 /**
  * 用户属性转换器
  * 
- * 对应 Scala: UserPropertyTransfer
- * 
- * 处理的事件类型: usr
+ *
+ * 1. isCdpEnabled 改为非阻塞查询 (大部分情况下命中本地缓存)
+ * 2. 如果需要多次调用，可以预加载
  */
 public class UserPropertyTransfer implements Serializable {
     
@@ -40,11 +38,13 @@ public class UserPropertyTransfer implements Serializable {
         this.configCacheService = configCacheService;
     }
 
-    
     /**
-     * 转换用户属性数据 (从 Map)
+     * 转换用户属性数据 (从 Map) - 优化版
+     * 
+     * 优化: isCdpEnabled 使用 join() 而不是 get()
+     * 因为 ConfigCacheService 有本地缓存，大部分情况下不会真正阻塞
      */
-    public List<UserPropertyRow> transferFromMap(Integer appId, Integer platform, Map<String, Object> pr) throws ExecutionException, InterruptedException {
+    public List<UserPropertyRow> transferFromMap(Integer appId, Integer platform, Map<String, Object> pr) {
         List<UserPropertyRow> result = new ArrayList<>();
         
         if (pr == null || appId == null) {
@@ -71,6 +71,8 @@ public class UserPropertyTransfer implements Serializable {
         }
         
         long timestamp = Timestamp.valueOf(time).getTime() / 1000;
+        
+        // ✅ 优化: 使用 join() 而不是 get()，有本地缓存时不会阻塞
         boolean cdpMode = isCdpEnabled(appId);
         
         // 处理自定义属性 (以 "_" 开头)
@@ -96,13 +98,24 @@ public class UserPropertyTransfer implements Serializable {
     }
 
     /**
-     * 检查应用是否开启 CDP - 改造新增
+     * 检查应用是否开启 CDP - 优化版
+     * 
+     * 使用 join() 而不是 get()，因为:
+     * 1. ConfigCacheService 有本地 Caffeine 缓存
+     * 2. 大部分情况下命中缓存，直接返回 CompletableFuture.completedFuture()
+     * 3. 不会真正阻塞
      */
-    private boolean isCdpEnabled(Integer appId) throws ExecutionException, InterruptedException {
+    private boolean isCdpEnabled(Integer appId) {
         if (configCacheService == null) {
             return false;
         }
-        return configCacheService.isCdpEnabled(appId).get();
+        try {
+            Boolean result = configCacheService.isCdpEnabled(appId).join();
+            return result != null && result;
+        } catch (Exception e) {
+            LOG.warn("检查CDP状态失败: appId={}", appId, e);
+            return false;
+        }
     }
     
     private UserPropertyRow processCustomPropertyFromMap(Integer appId, Integer platform, Map<String, Object> pr,
@@ -150,30 +163,30 @@ public class UserPropertyTransfer implements Serializable {
     }
     
     private String timestampToDateString(Long ct, Integer tz) {
-        if (ct == null || tz == null) return NULL_VALUE;
-        if (Math.abs(tz) > 48 * 3600 * 1000) return NULL_VALUE;
+        if (ct == null || tz == null) { return NULL_VALUE; }
+        if (Math.abs(tz) > 48 * 3600 * 1000) { return NULL_VALUE; }
         try { return DATE_FORMAT.get().format(ct); } 
         catch (Exception e) { return NULL_VALUE; }
     }
     
     private String getStringValue(Map<String, Object> map, String key) {
-        if (map == null || key == null) return NULL_VALUE;
+        if (map == null || key == null) { return NULL_VALUE; }
         Object value = map.get(key);
         return value != null ? String.valueOf(value) : NULL_VALUE;
     }
     
     private Long getLongValue(Map<String, Object> map, String key) {
         Object value = map.get(key);
-        if (value == null) return null;
-        if (value instanceof Number) return ((Number) value).longValue();
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).longValue(); }
         try { return Long.parseLong(String.valueOf(value)); } 
         catch (NumberFormatException e) { return null; }
     }
     
     private Integer getIntValue(Map<String, Object> map, String key) {
         Object value = map.get(key);
-        if (value == null) return null;
-        if (value instanceof Number) return ((Number) value).intValue();
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).intValue(); }
         try { return Integer.parseInt(String.valueOf(value)); } 
         catch (NumberFormatException e) { return null; }
     }
@@ -183,7 +196,7 @@ public class UserPropertyTransfer implements Serializable {
     }
     
     private String ensureLength(String value, int maxLength) {
-        if (isNullOrEmpty(value)) return NULL_VALUE;
+        if (isNullOrEmpty(value)) { return NULL_VALUE; }
         value = value.replaceAll("[\t\n\r\"\\\\\u0000]", " ").trim();
         return value.length() > maxLength ? value.substring(0, maxLength) : value;
     }

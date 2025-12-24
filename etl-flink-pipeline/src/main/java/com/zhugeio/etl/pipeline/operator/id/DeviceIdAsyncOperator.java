@@ -2,194 +2,200 @@ package com.zhugeio.etl.pipeline.operator.id;
 
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
-import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
-import com.zhugeio.etl.common.client.kvrocks.KvrocksClient;
+import com.zhugeio.etl.common.cache.CacheConfig;
+import com.zhugeio.etl.common.cache.CacheServiceFactory;
+import com.zhugeio.etl.common.cache.OneIdService;
+import com.zhugeio.etl.common.metrics.OperatorMetrics;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
-import com.zhugeio.etl.common.util.SnowflakeIdGenerator;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
+import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 设备ID异步映射算子 (雪花算法版本)
- * <p>
- * 优化点:
- * 1. ✅ 使用雪花算法生成ID,无需同步调用KVRocks incr
- * 2. ✅ 所有操作都是异步的
- * 3. ✅ workerId范围: 0-255 (与其他算子隔离)
+ * 设备ID异步映射算子 (优化版)
+ * 
+ * ✅ 优化点:
+ * 1. 使用 OneIdService 统一ID管理
+ * 2. 使用 Hash 结构存储，与原 Scala 一致
+ * 3. 使用雪花算法生成ID
+ * 4. 通过 CacheServiceFactory 管理单例
+ * 5. 集成 OperatorMetrics 监控
+ * 
+ * Hash结构: device_id:{appId} field={deviceMd5} value={zgDeviceId}
  */
 public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
-    private transient KvrocksClient kvrocks;
-    private transient Cache<String, Long> deviceCache;
-    private transient SnowflakeIdGenerator idGenerator;  // ✅ 新增
+    private static final Logger LOG = LoggerFactory.getLogger(DeviceIdAsyncOperator.class);
+
+    private transient OneIdService oneIdService;
+    private transient OperatorMetrics metrics;
 
     private final String kvrocksHost;
     private final int kvrocksPort;
     private final boolean kvrocksCluster;
+    private final Properties configProperties;
+    private final int metricsInterval;
 
     public DeviceIdAsyncOperator(String kvrocksHost, int kvrocksPort, boolean kvrocksCluster) {
+        this(kvrocksHost, kvrocksPort, kvrocksCluster, null, 60);
+    }
+
+    public DeviceIdAsyncOperator(String kvrocksHost, int kvrocksPort, boolean kvrocksCluster, Properties configProperties) {
+        this(kvrocksHost, kvrocksPort, kvrocksCluster, configProperties, 60);
+    }
+
+    public DeviceIdAsyncOperator(String kvrocksHost, int kvrocksPort, boolean kvrocksCluster, 
+                                  Properties configProperties, int metricsInterval) {
         this.kvrocksHost = kvrocksHost;
         this.kvrocksPort = kvrocksPort;
         this.kvrocksCluster = kvrocksCluster;
+        this.configProperties = configProperties;
+        this.metricsInterval = metricsInterval;
     }
 
     @Override
-    public void open(Configuration parameters) {
-        // 初始化KVRocks客户端
-        kvrocks = new KvrocksClient(kvrocksHost, kvrocksPort, kvrocksCluster);
-        kvrocks.init();
+    public void open(Configuration parameters) throws Exception {
+        // 初始化 Metrics
+        metrics = OperatorMetrics.create(
+                getRuntimeContext().getMetricGroup(),
+                "device_id_" + getRuntimeContext().getIndexOfThisSubtask(),
+                metricsInterval
+        );
 
-        // 测试连接
-        if (!kvrocks.testConnection()) {
-            throw new RuntimeException("KVRocks连接失败!");
-        }
-
-        // ✅ 初始化雪花算法生成器
-        // 使用主机名+slot ID生成workerId
-        int workerId = generateSnowflakeWorkerId();
-        int totalSubtasks = getRuntimeContext().getNumberOfParallelSubtasks();
-
-        if (totalSubtasks > 1024) {
-            throw new RuntimeException(
-                    "DeviceId算子最多支持1024个并行度,当前: " + totalSubtasks);
-        }
-
-        idGenerator = new SnowflakeIdGenerator(workerId);
-
-        // 初始化Caffeine缓存
-        deviceCache = Caffeine.newBuilder()
-                .maximumSize(100000)
-                .expireAfterWrite(10, TimeUnit.MINUTES)
-                .recordStats()
+        // 使用 CacheServiceFactory 获取或创建 OneIdService
+        CacheConfig cacheConfig = CacheConfig.builder()
+                .kvrocksHost(kvrocksHost)
+                .kvrocksPort(kvrocksPort)
+                .kvrocksCluster(kvrocksCluster)
                 .build();
 
-        System.out.printf(
-                "[DeviceId算子-%d] 初始化成功, KVRocks: %s:%d, workerId=%d%n",
-                getRuntimeContext().getIndexOfThisSubtask(), kvrocksHost, kvrocksPort, workerId
-        );
+        // 生成 workerId，确保分布式环境下唯一
+        int workerId = generateWorkerId();
+        
+        oneIdService = CacheServiceFactory.getOneIdService("device-id", cacheConfig, workerId);
+
+        LOG.info("[DeviceIdAsyncOperator-{}] 初始化成功, KVRocks: {}:{}, workerId={}",
+                getRuntimeContext().getIndexOfThisSubtask(), kvrocksHost, kvrocksPort, workerId);
     }
 
     @Override
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
+        metrics.in();
 
-        JSONObject usr = (JSONObject)input.getData().get("usr");
-        String did = usr.get("did").toString();
-        boolean isExistDid = StringUtils.isNotBlank(did);
+        // 跳过错误消息
+        if (input.getResult() == -1) {
+            metrics.skip();
+            resultFuture.complete(Collections.singleton(input));
+            return;
+        }
 
-        if(input.getResult() != -1 && isExistDid){
-            String cacheKey = "d:" + input.getAppId() + ":" + did;
-
-            Long cachedDeviceId = deviceCache.getIfPresent(cacheKey);
-
-            if (cachedDeviceId != null) {
-                ZGMessage output = createOutput(input, cachedDeviceId, false);
-                resultFuture.complete(Collections.singleton(output));
+        try {
+            JSONObject data = (JSONObject) input.getData();
+            if (data == null) {
+                metrics.skip();
+                resultFuture.complete(Collections.singleton(input));
                 return;
             }
 
-            kvrocks.asyncGet(cacheKey).thenCompose(zgDeviceIdStr -> {
-                if (zgDeviceIdStr != null) {
-                    Long zgDeviceId = Long.parseLong(zgDeviceIdStr);
-                    deviceCache.put(cacheKey, zgDeviceId);
-                    ZGMessage output = createOutput(input, zgDeviceId, false);
-                    return CompletableFuture.completedFuture(output);
-                } else {
-                    Long newDeviceId = idGenerator.nextId();
-                    // 使用asyncHSetIfAbsent替代asyncSet，避免并发问题
-                    kvrocks.asyncHSetIfAbsent("device_ids", cacheKey, newDeviceId.toString())
-                            .whenComplete((result, throwable) -> {
-                                if (throwable != null) {
-                                    System.err.println("DeviceId写入失败: " + cacheKey + ":" + newDeviceId);
-                                } else if (Boolean.TRUE.equals(result)) {
-                                    // 成功设置了新值
-                                    System.out.println("成功为设备分配新ID: " + cacheKey + " -> " + newDeviceId);
-                                } else {
-                                    // 值已经存在（可能被其他实例设置了）
-                                    System.out.println("设备ID已存在: " + cacheKey);
-                                }
-                            });
+            // 获取设备标识
+            JSONObject usr = data.getJSONObject("usr");
+            if (usr == null) {
+                metrics.skip();
+                resultFuture.complete(Collections.singleton(input));
+                return;
+            }
 
-                    deviceCache.put(cacheKey, newDeviceId);
-                    return CompletableFuture.completedFuture(
-                            createOutput(input, newDeviceId, true));
-                }
-            }).whenComplete((output, throwable) -> {
-                if (throwable != null) {
-                    resultFuture.completeExceptionally(throwable);
-                } else {
-                    resultFuture.complete(Collections.singleton(output));
-                }
-            });
-        }else {
+            String did = usr.getString("did");
+            if (StringUtils.isBlank(did)) {
+                metrics.skip();
+                resultFuture.complete(Collections.singleton(input));
+                return;
+            }
+
+            Integer appId = input.getAppId();
+            if (appId == null || appId == 0) {
+                metrics.skip();
+                resultFuture.complete(Collections.singleton(input));
+                return;
+            }
+
+            // 使用 OneIdService 获取或创建设备ID
+            oneIdService.getOrCreateDeviceId(appId, did)
+                    .thenAccept(zgDeviceId -> {
+                        if (zgDeviceId != null) {
+                            // 设置 $zg_did 到 usr 对象
+                            usr.put("$zg_did", zgDeviceId);
+
+                            // 同时设置到 data 数组中的每个 pr 对象
+                            Object dataListObj = data.get("data");
+                            if (dataListObj instanceof JSONArray) {
+                                JSONArray dataArray = (JSONArray) dataListObj;
+                                for (int i = 0; i < dataArray.size(); i++) {
+                                    JSONObject item = dataArray.getJSONObject(i);
+                                    if (item != null) {
+                                        JSONObject pr = item.getJSONObject("pr");
+                                        if (pr != null) {
+                                            pr.put("$zg_did", zgDeviceId);
+                                        }
+                                    }
+                                }
+                            }
+                            metrics.out();
+                        } else {
+                            metrics.skip();
+                        }
+                        resultFuture.complete(Collections.singleton(input));
+                    })
+                    .exceptionally(throwable -> {
+                        LOG.error("[DeviceIdAsyncOperator] 获取设备ID失败: appId={}, did={}", 
+                                appId, did, throwable);
+                        metrics.error();
+                        resultFuture.complete(Collections.singleton(input));
+                        return null;
+                    });
+
+        } catch (Exception e) {
+            LOG.error("[DeviceIdAsyncOperator] 处理异常", e);
+            metrics.error();
             resultFuture.complete(Collections.singleton(input));
         }
     }
 
-    private ZGMessage createOutput(ZGMessage input, Long zgDeviceId, boolean isNew) {
-        JSONObject data = (JSONObject) input.getData();
-        if (data == null) {
-            throw new IllegalArgumentException("input data is not a JSONObject");
-        }
-
-        JSONObject usr = (JSONObject) data.get("usr");
-        if (usr != null) {
-            usr.put("$zg_did", zgDeviceId);
-        }
-
-        if (data.get("data") instanceof JSONArray) {
-            JSONArray dataArray = (JSONArray) data.get("data");
-            for (Object item : dataArray) {
-                if (item instanceof JSONObject) {
-                    JSONObject jsonItem = (JSONObject) item;
-                    Object pr = jsonItem.get("pr");
-                    if (pr instanceof JSONObject) {
-                        JSONObject prObject = (JSONObject) pr;
-                        prObject.put("$zg_did", zgDeviceId);
-                    }
-                }
-            }
-        }
-
-        return input;
+    @Override
+    public void timeout(ZGMessage input, ResultFuture<ZGMessage> resultFuture) throws Exception {
+        LOG.warn("[DeviceIdAsyncOperator] 处理超时: partition={}, offset={}", 
+                input.getPartition(), input.getOffset());
+        metrics.error();
+        resultFuture.complete(Collections.singleton(input));
     }
 
     @Override
-    public void close() {
-        if (kvrocks != null) {
-            kvrocks.shutdown();
+    public void close() throws Exception {
+        if (metrics != null) {
+            metrics.shutdown();
         }
-
-        if (deviceCache != null) {
-            System.out.printf(
-                    "[DeviceId算子-%d] 缓存统计: %s%n",
-                    getRuntimeContext().getIndexOfThisSubtask(),
-                    deviceCache.stats()
-            );
-        }
+        // 注意: 不要在这里关闭 oneIdService，因为它是由 CacheServiceFactory 管理的单例
+        LOG.info("[DeviceIdAsyncOperator-{}] 关闭", getRuntimeContext().getIndexOfThisSubtask());
     }
 
     /**
-     * 使用主机名和slot ID组合生成workerID，确保在分布式环境中的唯一性
-     * @return workerId
+     * 生成 workerId
      */
-    private int generateSnowflakeWorkerId() {
+    private int generateWorkerId() {
         try {
-            // 使用主机信息和 slot 组合来生成 workerId
             String hostName = java.net.InetAddress.getLocalHost().getHostName();
             int slotId = getRuntimeContext().getIndexOfThisSubtask();
-
-            return Math.abs((hostName.hashCode() * 31 + slotId)) % 256;
+            // 使用 "device" 前缀区分不同类型的算子
+            return Math.abs(("device_" + hostName + "_" + slotId).hashCode()) % 1024;
         } catch (Exception e) {
-            // 回退到 subtask index
-            return getRuntimeContext().getIndexOfThisSubtask() % 256;
+            return getRuntimeContext().getIndexOfThisSubtask() % 1024;
         }
     }
-
 }

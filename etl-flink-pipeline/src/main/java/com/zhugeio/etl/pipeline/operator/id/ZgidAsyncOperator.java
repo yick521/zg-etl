@@ -1,9 +1,9 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONArray;
-import com.alibaba.fastjson2.JSONObject;
 import com.zhugeio.etl.common.cache.CacheConfig;
 import com.zhugeio.etl.common.cache.CacheServiceFactory;
+import com.zhugeio.etl.pipeline.archive.ArchiveKafkaService;
+import com.zhugeio.etl.pipeline.enums.ArchiveType;
 import com.zhugeio.etl.pipeline.service.OneIdService;
 import com.zhugeio.etl.common.metrics.OperatorMetrics;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
@@ -16,36 +16,20 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 诸葛ID异步映射算子 (优化版)
- * 
- * ✅ 优化点:
- * 1. 使用 OneIdService 统一ID管理
- * 2. 使用 Hash 结构存储，与原 Scala 一致
- * 3. 完整的用户-设备绑定逻辑
- * 4. 通过 CacheServiceFactory 管理单例
- * 5. 集成 OperatorMetrics 监控
- * 
- * Hash结构:
- * - device_zgid:{appId} field={zgDeviceId} value={zgId}
- * - user_zgid:{appId} field={zgUserId} value={zgId}
- * - zgid_user:{appId} field={zgId} value={zgUserId} (反向映射)
- * 
- * 核心逻辑 (与原Scala一致):
- * 1. 有 zgUserId:
- *    - 用户已有zgId → 绑定设备到用户的zgId
- *    - 用户无zgId，设备有zgId → 绑定用户到设备的zgId
- *    - 都没有 → 创建新zgId，绑定用户和设备
- * 2. 无 zgUserId (匿名):
- *    - 设备有zgId → 返回
- *    - 设备无zgId → 创建新zgId
+ * 诸葛ID异步映射算子 - 修复版
+ *
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
  */
 public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(ZgidAsyncOperator.class);
-
+    private final ArchiveKafkaService archiveKafkaService = ArchiveKafkaService.getInstance();
     private transient OneIdService oneIdService;
     private transient OperatorMetrics metrics;
 
@@ -75,13 +59,11 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        // 初始化 Metrics
         metrics = OperatorMetrics.create(
                 getRuntimeContext().getMetricGroup(),
                 "zgid_" + getRuntimeContext().getIndexOfThisSubtask(),
                 metricsInterval
         );
-
 
         OneIdService.initialize(kvrocksHost, kvrocksPort, kvrocksCluster);
         oneIdService = OneIdService.getInstance();
@@ -91,6 +73,7 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         metrics.in();
 
@@ -101,7 +84,8 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
         }
 
         try {
-            JSONObject data = (JSONObject) input.getData();
+            //  修复: 使用 Map 方式访问数据
+            Map<String, Object> data = (Map<String, Object>) input.getData();
             if (data == null) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
@@ -117,36 +101,57 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
             // 获取 data 数组
             Object dataListObj = data.get("data");
-            if (!(dataListObj instanceof JSONArray)) {
+            if (!(dataListObj instanceof List)) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
                 return;
             }
 
-            JSONArray dataArray = (JSONArray) dataListObj;
+            List<Map<String, Object>> dataArray = (List<Map<String, Object>>) dataListObj;
             List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-            for (int i = 0; i < dataArray.size(); i++) {
-                JSONObject item = dataArray.getJSONObject(i);
+            for (Map<String, Object> item : dataArray) {
                 if (item == null) continue;
 
-                JSONObject pr = item.getJSONObject("pr");
+                Map<String, Object> pr = (Map<String, Object>) item.get("pr");
                 if (pr == null) continue;
 
                 // 获取 $zg_did (必须)
-                Long zgDeviceId = pr.getLong("$zg_did");
+                Long zgDeviceId = parseLong(pr.get("$zg_did"));
                 if (zgDeviceId == null) {
                     continue;
                 }
 
                 // 获取 $zg_uid (可选)
-                Long zgUserId = pr.getLong("$zg_uid");
+                Long zgUserId = parseLong(pr.get("$zg_uid"));
 
                 // 异步获取或创建诸葛ID
                 CompletableFuture<Void> future = oneIdService.getOrCreateZgid(appId, zgDeviceId, zgUserId)
-                        .thenAccept(zgId -> {
-                            if (zgId != null) {
+                        .thenAccept(oneIdResult -> {
+                            if (oneIdResult != null) {
+                                Long zgId = oneIdResult.getId();
+                                // 消息添加 zgId
                                 pr.put("$zg_zgid", zgId);
+                                // 是否需要输出 id 之间的映射关系至 kafka
+                                Boolean isNew = oneIdResult.getIsNew();
+                                if(isNew){
+                                    for (ArchiveType archiveType : oneIdResult.getArchiveTypes()) {
+                                        switch (archiveType){
+                                            case DEVICE_ZGID: {
+                                                archiveKafkaService.sendToKafka(ArchiveType.DEVICE_ZGID, appId,String.valueOf(zgDeviceId), zgId);
+                                                break;
+                                            }
+                                            case USER_ZGID: {
+                                                archiveKafkaService.sendToKafka(ArchiveType.USER_ZGID, appId,String.valueOf(zgUserId), zgId);
+                                                break;
+                                            }
+                                            case ZGID_USER: {
+                                                archiveKafkaService.sendToKafka(ArchiveType.ZGID_USER, appId,String.valueOf(zgId),zgUserId);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         })
                         .exceptionally(throwable -> {
@@ -182,6 +187,26 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
         }
     }
 
+    /**
+     * 安全解析Long值
+     */
+    private Long parseLong(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Long) {
+            return (Long) value;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).longValue();
+        }
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     @Override
     public void timeout(ZGMessage input, ResultFuture<ZGMessage> resultFuture) throws Exception {
         LOG.warn("[ZgidAsyncOperator] 处理超时");
@@ -198,5 +223,4 @@ public class ZgidAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
                 getRuntimeContext().getIndexOfThisSubtask(),
                 oneIdService != null ? oneIdService.getStats() : "N/A");
     }
-
 }

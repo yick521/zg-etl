@@ -1,13 +1,11 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
 import com.alibaba.fastjson2.JSON;
-import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
 import com.zhugeio.etl.common.cache.CacheConfig;
 import com.zhugeio.etl.common.cache.CacheServiceFactory;
 import com.zhugeio.etl.common.cache.ConfigCacheService;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
-import com.zhugeio.etl.common.util.OperatorUtil;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
@@ -18,22 +16,16 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 虚拟事件处理算子 - 改造版 (只读)
+ * 虚拟事件处理算子 - 修复版
  * 
- * 改造点:
- * 1. 移除独立的本地缓存，使用统一的 ConfigCacheService
- * 2. Key/Field 格式与 cache-sync 同步服务保持一致
- * 
- * KVRocks Key 对照 (与同步服务一致):
- * - virtualEventAppidsSet (Set): member=appId - 检查应用是否有虚拟事件
- * - virtualEventMap (Hash): field=appId_owner_eventName - 虚拟事件配置
- * - virtualEventAttrMap (Hash): field=appId_virtualEventName_owner_eventName - 虚拟事件属性
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
  */
 public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(VirtualEventOperator.class);
 
-    // 使用统一缓存服务
     private transient ConfigCacheService cacheService;
 
     private CacheConfig cacheConfig = null;
@@ -46,11 +38,12 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
     public void open(Configuration parameters) {
         cacheService = CacheServiceFactory.getInstance(cacheConfig);
 
-        LOG.info("[VirtualEventOperator-{}] 初始化成功 (使用统一缓存服务)",
+        LOG.info("[VirtualEventOperator-{}] 初始化成功",
                 getRuntimeContext().getIndexOfThisSubtask());
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         try {
             if (input.getResult() == -1) {
@@ -64,14 +57,12 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
                 return;
             }
 
-            // 使用统一缓存服务检查应用是否有虚拟事件
             cacheService.hasVirtualEvent(appId)
                     .thenCompose(hasVirtualEvent -> {
                         if (!hasVirtualEvent) {
                             return CompletableFuture.completedFuture(Collections.singletonList(input));
                         }
 
-                        // 处理虚拟事件
                         return processVirtualEvents(input, appId);
                     })
                     .whenComplete((outputs, throwable) -> {
@@ -92,37 +83,37 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
     /**
      * 处理虚拟事件
      */
+    @SuppressWarnings("unchecked")
     private CompletableFuture<Collection<ZGMessage>> processVirtualEvents(ZGMessage input, Integer appId) {
-        JSONObject inputData = (JSONObject) input.getData();
+        //  修复: 使用 Map 方式访问数据
+        Map<String, Object> inputData = (Map<String, Object>) input.getData();
         if (inputData == null) {
             return CompletableFuture.completedFuture(Collections.singletonList(input));
         }
 
-        String oldOwner = inputData.getString("owner");
+        String oldOwner = String.valueOf(inputData.get("owner"));
         Object dataObj = inputData.get("data");
 
-        if (!(dataObj instanceof JSONArray)) {
+        if (!(dataObj instanceof List)) {
             return CompletableFuture.completedFuture(Collections.singletonList(input));
         }
 
-        JSONArray dataArray = (JSONArray) dataObj;
+        List<Map<String, Object>> dataArray = (List<Map<String, Object>>) dataObj;
         List<CompletableFuture<List<ZGMessage>>> eventFutures = new ArrayList<>();
 
-        // 遍历每个事件数据项
-        for (int i = 0; i < dataArray.size(); i++) {
-            JSONObject dataItem = dataArray.getJSONObject(i);
+        for (Map<String, Object> dataItem : dataArray) {
             if (dataItem == null) {
                 continue;
             }
 
-            String dt = dataItem.getString("dt");
-            JSONObject pr = dataItem.getJSONObject("pr");
+            String dt = String.valueOf(dataItem.get("dt"));
+            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
 
             if (("evt".equals(dt) || "abp".equals(dt)) && pr != null) {
-                String eventName = pr.getString("$eid");
+                String eventName = String.valueOf(pr.get("$eid"));
                 String owner = getOwner(dt, oldOwner);
 
-                if (eventName != null) {
+                if (eventName != null && !"null".equals(eventName)) {
                     CompletableFuture<List<ZGMessage>> future = processOneEvent(
                             input, appId, owner, eventName, pr, dataItem);
                     eventFutures.add(future);
@@ -137,7 +128,7 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
         return CompletableFuture.allOf(eventFutures.toArray(new CompletableFuture[0]))
                 .thenApply(v -> {
                     List<ZGMessage> results = new ArrayList<>();
-                    results.add(input); // 原始消息
+                    results.add(input);
 
                     for (CompletableFuture<List<ZGMessage>> future : eventFutures) {
                         try {
@@ -157,8 +148,8 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
      */
     private CompletableFuture<List<ZGMessage>> processOneEvent(ZGMessage input, Integer appId, 
                                                                 String owner, String eventName, 
-                                                                JSONObject pr, JSONObject dataItem) {
-        // 使用统一缓存服务获取虚拟事件配置
+                                                                Map<String, Object> pr, 
+                                                                Map<String, Object> dataItem) {
         return cacheService.getVirtualEvents(appId, owner, eventName)
                 .thenCompose(virtualEvents -> {
                     if (virtualEvents == null || virtualEvents.isEmpty()) {
@@ -173,16 +164,11 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
                             String virtualAlias = (String) virtualEvent.get("virtual_alias");
                             Object filtersObj = virtualEvent.get("filters");
 
-                            // 检查过滤条件
                             if (matchFilters(pr, filtersObj)) {
-                                // 获取虚拟事件的属性集合
                                 CompletableFuture<ZGMessage> msgFuture = 
                                         cacheService.getVirtualEventAttrs(appId, virtualName, owner, eventName)
-                                                .thenApply(attrs -> {
-                                                    ZGMessage virtualMsg = createVirtualEventMessage(
-                                                            input, virtualName, virtualAlias, pr, dataItem, attrs);
-                                                    return virtualMsg;
-                                                });
+                                                .thenApply(attrs -> createVirtualEventMessage(
+                                                        input, virtualName, virtualAlias, pr, dataItem, attrs));
 
                                 messageFutures.add(msgFuture);
                             }
@@ -216,26 +202,27 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
     /**
      * 检查过滤条件
      */
-    private boolean matchFilters(JSONObject pr, Object filtersObj) {
+    private boolean matchFilters(Map<String, Object> pr, Object filtersObj) {
         if (filtersObj == null) {
             return true;
         }
 
         try {
-            JSONObject filters;
+            Map<String, Object> filters = null;
+            
             if (filtersObj instanceof String) {
-                filters = JSON.parseObject((String) filtersObj);
-            } else if (filtersObj instanceof JSONObject) {
-                filters = (JSONObject) filtersObj;
-            } else {
-                return true;
+                JSONObject jsonFilters = JSON.parseObject((String) filtersObj);
+                if (jsonFilters != null) {
+                    filters = new HashMap<>(jsonFilters);
+                }
+            } else if (filtersObj instanceof Map) {
+                filters = (Map<String, Object>) filtersObj;
             }
 
             if (filters == null || filters.isEmpty()) {
                 return true;
             }
 
-            // 实现过滤逻辑
             for (String key : filters.keySet()) {
                 Object filterValue = filters.get(key);
                 Object prValue = pr.get("_" + key);
@@ -258,11 +245,11 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
     /**
      * 创建虚拟事件消息
      */
+    @SuppressWarnings("unchecked")
     private ZGMessage createVirtualEventMessage(ZGMessage input, String virtualName, 
-                                                  String virtualAlias, JSONObject pr, 
-                                                  JSONObject dataItem, Set<String> attrs) {
+                                                  String virtualAlias, Map<String, Object> pr, 
+                                                  Map<String, Object> dataItem, Set<String> attrs) {
         try {
-            // 创建新的虚拟事件消息
             ZGMessage virtualMsg = new ZGMessage();
             virtualMsg.setAppId(input.getAppId());
             virtualMsg.setSdk(input.getSdk());
@@ -279,15 +266,16 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
             virtualMsg.setErrorCode(input.getErrorCode());
             virtualMsg.setErrorDescribe(input.getErrorDescribe());
 
-            JSONObject virtualData = (JSONObject) virtualMsg.getData();
-            JSONArray newDataArray = new JSONArray();
+            // 创建新的数据结构
+            Map<String, Object> virtualData = new HashMap<>((Map<String, Object>) input.getData());
+            List<Map<String, Object>> newDataArray = new ArrayList<>();
 
-            JSONObject newDataItem = new JSONObject();
-            newDataItem.put("dt", dataItem.getString("dt"));
+            Map<String, Object> newDataItem = new HashMap<>();
+            newDataItem.put("dt", dataItem.get("dt"));
             newDataItem.put("ct", dataItem.get("ct"));
 
             // 创建新的属性对象
-            JSONObject newPr = new JSONObject();
+            Map<String, Object> newPr = new HashMap<>();
             newPr.put("$eid", virtualName);
             if (virtualAlias != null) {
                 newPr.put("$alias", virtualAlias);
@@ -309,6 +297,8 @@ public class VirtualEventOperator extends RichAsyncFunction<ZGMessage, ZGMessage
             newDataItem.put("pr", newPr);
             newDataArray.add(newDataItem);
             virtualData.put("data", newDataArray);
+            
+            virtualMsg.setData(virtualData);
 
             return virtualMsg;
         } catch (Exception e) {

@@ -1,4 +1,4 @@
-CREATE TABLE `b_user_138` (
+CREATE TABLE `b_user_144` (
                               `device_id` BIGINT NULL,
                               `zg_id` BIGINT NULL,
                               `user_id` BIGINT NULL,
@@ -23,7 +23,7 @@ PROPERTIES (
 "group_commit_data_bytes" = "134217728"
 );
 
-CREATE TABLE `b_device_138` (
+CREATE TABLE `b_device_144` (
                                 `device_id` BIGINT NULL,
                                 `device_md5` VARCHAR(500) NULL,
                                 `platform` SMALLINT NULL,
@@ -65,7 +65,7 @@ PROPERTIES (
 "group_commit_data_bytes" = "134217728"
 );
 
-CREATE TABLE `b_user_property_138` (
+CREATE TABLE `b_user_property_144` (
                                        `zg_id` BIGINT NULL,
                                        `property_id` INT NULL,
                                        `user_id` BIGINT NULL,
@@ -93,7 +93,7 @@ PROPERTIES (
 "group_commit_data_bytes" = "134217728"
 );
 
-CREATE TABLE `b_user_event_attr_138` (
+CREATE TABLE `b_user_event_attr_144` (
                                          `zg_id` BIGINT NULL,
                                          `session_id` BIGINT NULL,
                                          `uuid` VARCHAR(255) NULL,
@@ -367,7 +367,7 @@ PARTITION p2026_11 VALUES [("20260309"), ("20260316")),
 PARTITION p2026_12 VALUES [("20260316"), ("20260323")),
 PARTITION p2026_13 VALUES [("20260323"), ("20260330")),
 PARTITION p2026_14 VALUES [("20260330"), ("20260406")))
-DISTRIBUTED BY HASH(`event_id`) BUCKETS 8
+DISTRIBUTED BY HASH(`zg_id`) BUCKETS 8
 PROPERTIES (
 "replication_allocation" = "tag.location.default: 3",
 "min_load_replica_num" = "-1",

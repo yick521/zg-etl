@@ -1,5 +1,6 @@
 package com.zhugeio.etl.pipeline.main;
 
+import com.alibaba.fastjson.JSON;
 import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.kafka.ZGMsgSchema;
@@ -93,10 +94,10 @@ public class GateJob {
         // 1. 创建 KafkaSource
         KafkaSource<ZGMessage> kafkaSource = KafkaSource.<ZGMessage>builder()
                 .setBootstrapServers(Config.getString(Config.KAFKA_BROKERS))
-                .setTopics(Config.getString("kafka.gate.sourceTopic"))
-                .setGroupId(Config.getString("kafka.gate.group.id"))
+                .setTopics(Config.getString(Config.KAFKA_GATE_SOURCE_TOPIC))
+                .setGroupId(Config.getString(Config.KAFKA_GATE_GROUP_ID))
                 .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST))
-                .setProperties(getRateLimitProperties())
+                .setProperties(Config.getKafkaConsumerProps())
                 .setDeserializer(new ZGMsgSchema())
                 .build();
 
@@ -135,7 +136,7 @@ public class GateJob {
         // 主流输出到下游 (ID Job)
         if (sinkToDownstream) {
             CustomKafkaSink.addCustomKafkaSink(
-                    result.map(ZGMessage::getRawData),
+                    result.map(msg -> JSON.toJSONString(msg.getData())),
                     Config.getString(Config.KAFKA_ID_SOURCE_TOPIC),
                     Config.getString(Config.KAFKA_BROKERS),
                     true,

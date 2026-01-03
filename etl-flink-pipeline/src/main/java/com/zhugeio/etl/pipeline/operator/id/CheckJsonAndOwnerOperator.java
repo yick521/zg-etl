@@ -50,6 +50,7 @@ public class CheckJsonAndOwnerOperator extends RichMapFunction<ZGMessage, ZGMess
 
             map.put("owner", owner);
             zgMessage.setData(map);
+            zgMessage.setJson(zgMessage.getRawData());
             errMap.remove("data");
             zgMessage.setErrData(errMap);
         } catch (Exception e) {

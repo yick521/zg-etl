@@ -2,8 +2,8 @@ package com.zhugeio.etl.pipeline.service;
 
 import com.zhugeio.etl.common.client.kvrocks.KvrocksClient;
 import com.zhugeio.etl.common.util.SnowflakeIdGenerator;
+import com.zhugeio.etl.pipeline.enums.ArchiveType;
 import lombok.Data;
-import org.apache.flink.api.java.tuple.Tuple2;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,10 +11,13 @@ import java.io.Serializable;
 import java.lang.management.ManagementFactory;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+
 
 /**
  * OneId服务 - 统一ID管理 (静态单例版本，适用于Flink TaskManager)
@@ -57,18 +60,24 @@ public class OneIdService {
 
     // ==================== 配置参数 (静态存储，用于延迟初始化) ====================
 
-    private static volatile String staticKvrocksHost;
-    private static volatile int staticKvrocksPort;
-    private static volatile boolean staticKvrocksCluster;
-    private static volatile Integer staticWorkerId;
 
-    // ==================== Hash Key 前缀 (与原Scala一致) ====================
 
-    private static final String DEVICE_ID_HASH = "device_id:";      // device_id:{appId}
-    private static final String USER_ID_HASH = "user_id:";          // user_id:{appId}
-    private static final String DEVICE_ZGID_HASH = "device_zgid:";  // device_zgid:{appId}
-    private static final String USER_ZGID_HASH = "user_zgid:";      // user_zgid:{appId}
-    private static final String ZGID_USER_HASH = "zgid_user:";      // zgid_user:{appId}
+    /** 设备ID映射: d:{appId} -> Hash(deviceMd5 -> deviceId) */
+    public static final String DEVICE_ID_PREFIX = "d:";
+
+    /** 用户ID映射: u:{appId} -> Hash(propertyValue -> userId) */
+    public static final String USER_ID_PREFIX = "u:";
+
+    /** userId->zgId映射: uz:{appId} -> Hash(userId -> zgId) */
+    public static final String USER_ZGID_PREFIX = "uz:";
+
+    /** zgId->userId映射: zu:{appId} -> Hash(zgId -> userId) */
+    public static final String ZGID_USER_PREFIX = "zu:";
+
+    /** deviceId->zgId映射: dz:{appId} -> Hash(deviceId -> zgId) */
+    public static final String ZGID_DEVICE_PREFIX = "dz:";
+
+
 
     // ==================== 实例成员 ====================
 
@@ -122,12 +131,6 @@ public class OneIdService {
                 LOG.warn("OneIdService 已经初始化，忽略重复调用");
                 return;
             }
-
-            // 保存配置
-            staticKvrocksHost = kvrocksHost;
-            staticKvrocksPort = kvrocksPort;
-            staticKvrocksCluster = kvrocksCluster;
-            staticWorkerId = workerId;
 
             // 创建并初始化实例
             INSTANCE = new OneIdService(kvrocksHost, kvrocksPort, kvrocksCluster, workerId);
@@ -202,10 +205,6 @@ public class OneIdService {
                 INSTANCE = null;
             }
             INITIALIZED.set(false);
-            staticKvrocksHost = null;
-            staticKvrocksPort = 0;
-            staticKvrocksCluster = false;
-            staticWorkerId = null;
             LOG.info("OneIdService 单例已关闭并重置");
         }
     }
@@ -257,26 +256,48 @@ public class OneIdService {
     @Data
     public static class OneIdResult implements Serializable {
         /**
-         * 是否是新创建的id
-         * 查询获取到的id为 false
+         * 是否需要输出 id之间的映射关系
          */
-        private Boolean isNew;
+        private final Boolean isNew;
+        /**
+         * 目标id
+         */
         private Long id;
+        /**
+         * 要输出 id关系的类型列表
+         */
+        private List<ArchiveType> archiveTypes;
 
-        public static OneIdResult build(Long id) {
+        public OneIdResult() {
+            isNew = false;
+        }
+
+        public OneIdResult(Boolean isNew, Long id) {
+            this.isNew = isNew;
+            this.id = id;
+        }
+
+        private static OneIdResult build(Long id) {
             return build(false, id);
         }
-        public static OneIdResult build(String id) {
+        private static OneIdResult build(String id) {
             return build(false, id);
         }
-        public static OneIdResult build(Boolean isNew,String id) {
+        private static OneIdResult build(Boolean isNew,String id) {
             return build(isNew, Long.parseLong(id));
         }
-        public static OneIdResult build(Boolean isNew,Long id) {
-            OneIdResult result = new OneIdResult();
-            result.setIsNew(isNew);
-            result.setId(id);
-            return result;
+        private static OneIdResult build(Boolean isNew,Long id) {
+            return new OneIdResult(isNew, id);
+        }
+
+        /**
+         * 添加归档类型
+         */
+        public void addArchiveType(ArchiveType archiveType) {
+            if (archiveTypes == null) {
+                archiveTypes = new ArrayList<>();
+            }
+            archiveTypes.add(archiveType);
         }
     }
 
@@ -292,7 +313,7 @@ public class OneIdService {
             return CompletableFuture.completedFuture(null);
         }
 
-        String hashKey = DEVICE_ID_HASH + appId;
+        String hashKey = DEVICE_ID_PREFIX + appId;
 
         return kvrocksClient.asyncHGet(hashKey, deviceMd5)
                 .thenCompose(existingId -> {
@@ -343,7 +364,7 @@ public class OneIdService {
             return CompletableFuture.completedFuture(null);
         }
 
-        String hashKey = USER_ID_HASH + appId;
+        String hashKey = USER_ID_PREFIX + appId;
 
         return kvrocksClient.asyncHGet(hashKey, cuid)
                 .thenCompose(existingId -> {
@@ -384,131 +405,246 @@ public class OneIdService {
     /**
      * 获取或创建诸葛ID - 完整实现用户设备绑定逻辑
      *
+     * Hash结构 :
+     * - dz:{appId} → Hash(zgDeviceId -> zgId)  设备→诸葛ID映射
+     * - uz:{appId} → Hash(zgUserId -> zgId)    用户→诸葛ID映射
+     * - zu:{appId} → Hash(zgId -> zgUserId)    诸葛ID→用户反向映射
+     *
      * 逻辑流程:
-     * 1. 如果有 zgUserId:
-     *    - 查询 user_zgid:{appId} → zgId
-     *    - 如果用户已有zgId → 绑定设备到此zgId → 返回zgId
+     * 1. 如果有 zgUserId (实名用户):
+     *    - 查询 uz:{appId} HGET zgUserId → zgId
+     *    - 如果用户已有zgId → 绑定设备到此zgId (dz HSET) → 返回zgId
      *    - 如果用户无zgId:
-     *      - 查询 device_zgid:{appId} → zgId
-     *      - 如果设备有zgId → 将用户绑定到此zgId → 返回zgId
-     *      - 如果设备无zgId → 生成新zgId → 绑定用户和设备 → 返回新zgId
+     *      - 查询 dz:{appId} HGET zgDeviceId → zgId
+     *      - 如果设备有zgId → 将用户绑定到此zgId (uz HSET + zu HSET) → 返回zgId
+     *      - 如果设备无zgId → 生成新zgId → 绑定用户和设备 (dz + uz + zu 全部HSET) → 返回新zgId
      * 2. 如果无 zgUserId (匿名用户):
-     *    - 查询 device_zgid:{appId} → zgId
+     *    - 查询 dz:{appId} HGET zgDeviceId → zgId
      *    - 如果设备有zgId → 返回zgId
-     *    - 如果设备无zgId → 生成新zgId → 绑定设备 → 返回新zgId
+     *    - 如果设备无zgId → 生成新zgId → 绑定设备 (dz HSET) → 返回新zgId
+     *
+     * 并发安全: 使用 HSETNX 原子写入，冲突时自动获取已存在的zgId
+     *
+     * @param appId      应用ID (必填)
+     * @param zgDeviceId 设备ID，来自 $zg_did (必填)
+     * @param zgUserId   用户ID，来自 $zg_uid (可选，null表示匿名用户)
+     * @return 诸葛ID，失败返回null
      */
-    public CompletableFuture<Long> getOrCreateZgid(Integer appId, Long zgDeviceId, Long zgUserId) {
+    public CompletableFuture<OneIdResult> getOrCreateZgid(Integer appId, Long zgDeviceId, Long zgUserId) {
         if (appId == null || zgDeviceId == null) {
             return CompletableFuture.completedFuture(null);
         }
 
-        String deviceZgidHash = DEVICE_ZGID_HASH + appId;
+        String dzHash = ZGID_DEVICE_PREFIX + appId;
         String deviceField = String.valueOf(zgDeviceId);
 
-        // 有实名用户
-        if (zgUserId != null) {
-            String userZgidHash = USER_ZGID_HASH + appId;
-            String userField = String.valueOf(zgUserId);
-            String zgidUserHash = ZGID_USER_HASH + appId;
+        // 实名用户：完整绑定逻辑
+        String uzHash = USER_ZGID_PREFIX + appId;
+        String userField = String.valueOf(zgUserId);
+        String zuHash = ZGID_USER_PREFIX + appId;
 
-            // 先查用户的zgid
-            return kvrocksClient.asyncHGet(userZgidHash, userField)
-                    .thenCompose(userZgid -> {
-                        if (userZgid != null) {
-                            existIdCount.incrementAndGet();
-                            // 用户已有zgid，绑定设备到此zgid (幂等操作)
-                            kvrocksClient.asyncHSet(deviceZgidHash, deviceField, userZgid);
-                            bindingCount.incrementAndGet();
-                            try {
-                                return CompletableFuture.completedFuture(Long.parseLong(userZgid));
-                            } catch (NumberFormatException e) {
-                                return CompletableFuture.completedFuture(null);
+        // 没有 uid 的处理
+        if (zgUserId == null) {
+            return getOrCreateDeviceZgid(dzHash, deviceField);
+        }
+
+        // 返回带有 uid 的处理结果
+        return getOrCreateUserZgid(dzHash, deviceField, uzHash, userField, zuHash);
+    }
+
+    /**
+     * 根据 did 获取|生成 zgId
+     * @param dzHash did -> zgId
+     * @param deviceField did key
+     * @return
+     */
+    private CompletableFuture<OneIdResult> getOrCreateDeviceZgid(String dzHash, String deviceField) {
+        return kvrocksClient
+                .asyncHGet(dzHash, deviceField) // 查询 did -> zgId 的映射
+                .thenCompose(
+                        existingZgid -> {
+                            if (existingZgid != null) { // 存在 did -> zgId
+                                existIdCount.incrementAndGet();
+                                // 将查询到的 zgId 包装返回
+                                return CompletableFuture.completedFuture(OneIdResult.build(existingZgid));
                             }
+                            // 不存在 did -> zgId 则创建
+                            return createNewZgidForDevice(dzHash, deviceField);
                         }
+                    );
+    }
 
-                        // 用户无zgid，查设备的zgid
-                        return kvrocksClient.asyncHGet(deviceZgidHash, deviceField)
-                                .thenCompose(deviceZgid -> {
-                                    if (deviceZgid != null) {
-                                        existIdCount.incrementAndGet();
-                                        // 设备有zgid，将用户绑定到此zgid
-                                        kvrocksClient.asyncHSet(userZgidHash, userField, deviceZgid);
-                                        kvrocksClient.asyncHSet(zgidUserHash, deviceZgid, userField);
-                                        bindingCount.incrementAndGet();
-                                        try {
-                                            return CompletableFuture.completedFuture(Long.parseLong(deviceZgid));
-                                        } catch (NumberFormatException e) {
-                                            return CompletableFuture.completedFuture(null);
-                                        }
+    /**
+     * 创建 uid -> zgId
+     * @param dzHash
+     * @param deviceField
+     * @return
+     */
+    private CompletableFuture<OneIdResult> createNewZgidForDevice(String dzHash, String deviceField) {
+        Long newZgid = idGenerator.nextId();
+        String newZgidStr = String.valueOf(newZgid);
+
+        return kvrocksClient
+                .asyncHSetIfAbsent(dzHash, deviceField, newZgidStr) // 写入 did -> zgId 的映射
+                .thenCompose(success -> {
+                    if (success) {
+                        newIdCount.incrementAndGet();
+                        // 制作返回结果
+                        OneIdResult oneIdResult = OneIdResult.build(true, newZgid);
+                        // 标记增加了 did -> zgId 的映射
+                        oneIdResult.addArchiveType(ArchiveType.DEVICE_ZGID);
+                        return CompletableFuture.completedFuture(oneIdResult);
+                    }
+                    // 冲突：获取实际值
+                    conflictCount.incrementAndGet();
+                    return kvrocksClient.asyncHGet(dzHash, deviceField)
+                            .thenCompose(
+                                    // 将查询到的 zgId 包装返回
+                                    zgId -> {
+                                        OneIdResult oneIdResult = OneIdResult.build(parseLongSafe(zgId));
+                                        return CompletableFuture.completedFuture(oneIdResult);
                                     }
+                            );
 
-                                    // 都没有，生成新zgId
-                                    Long newZgid = idGenerator.nextId();
-                                    String newZgidStr = String.valueOf(newZgid);
-                                    newIdCount.incrementAndGet();
+                });
+    }
 
-                                    // 使用 HSETNX 原子写入用户映射
-                                    return kvrocksClient.asyncHSetIfAbsent(userZgidHash, userField, newZgidStr)
-                                            .thenCompose(success -> {
-                                                if (success) {
-                                                    // 写入成功，同时绑定设备和反向映射
-                                                    kvrocksClient.asyncHSet(deviceZgidHash, deviceField, newZgidStr);
-                                                    kvrocksClient.asyncHSet(zgidUserHash, newZgidStr, userField);
-                                                    return CompletableFuture.completedFuture(newZgid);
-                                                } else {
-                                                    // 发生冲突，获取实际的zgId
-                                                    conflictCount.incrementAndGet();
-                                                    return kvrocksClient.asyncHGet(userZgidHash, userField)
-                                                            .thenApply(id -> {
-                                                                if (id != null) {
-                                                                    // 绑定设备到获取的zgId
-                                                                    kvrocksClient.asyncHSet(deviceZgidHash, deviceField, id);
-                                                                    try {
-                                                                        return Long.parseLong(id);
-                                                                    } catch (NumberFormatException e) {
-                                                                        return null;
-                                                                    }
-                                                                }
-                                                                return null;
-                                                            });
-                                                }
-                                            });
-                                });
-                    });
-        } else {
-            // 匿名用户，只处理设备
-            return kvrocksClient.asyncHGet(deviceZgidHash, deviceField)
-                    .thenCompose(existingZgid -> {
-                        if (existingZgid != null) {
-                            existIdCount.incrementAndGet();
-                            try {
-                                return CompletableFuture.completedFuture(Long.parseLong(existingZgid));
-                            } catch (NumberFormatException e) {
-                                return CompletableFuture.completedFuture(null);
+
+    /**
+     *
+     * 根据 uid 获取|生成 zgId
+     * 处理 uid -> zgId
+     * 处理 zgId -> uid
+     * 处理 did -> zgId
+     * @param dzHash did -> zgId
+     * @param deviceField did
+     * @param uzHash uid -> zgId
+     * @param userField uid
+     * @param zuHash zgId -> uid 反向映射
+     * @return
+     */
+    private CompletableFuture<OneIdResult> getOrCreateUserZgid(String dzHash, String deviceField,
+                                                        String uzHash, String userField,
+                                                        String zuHash) {
+        // 1. 先查用户的zgId
+        return kvrocksClient.asyncHGet(uzHash, userField) // 查询 uid -> zgId 的映射
+                .thenCompose(
+                        zgId -> {
+                            if (zgId != null) { // 存在 uid -> zgId
+                                // 记录
+                                existIdCount.incrementAndGet();
+                                bindingCount.incrementAndGet();
+                                // 此时可能存在 did -> zgId 的映射 , 但是这里查询的话会浪费资源 , 直接幂等输出 did -> zgId 的映射 , 不影响最终逻辑
+                                // 或者这里可以查询 did -> zgId 的映射是否存在
+                                CompletableFuture.allOf(
+                                        // add: did -> zgId
+                                        kvrocksClient.asyncHSet(dzHash, deviceField, zgId)
+                                );
+                                OneIdResult oneIdResult = OneIdResult.build(true, zgId);
+                                oneIdResult.addArchiveType(ArchiveType.DEVICE_ZGID);
+                                return CompletableFuture.completedFuture(oneIdResult);
                             }
+                            // 2. uid 无zgId，查  did -> zgId
+                            return handleUserWithoutZgid(dzHash, deviceField, uzHash, userField, zuHash);
                         }
+                );
+    }
 
-                        Long newZgid = idGenerator.nextId();
-                        String newZgidStr = String.valueOf(newZgid);
+    /**
+     * 处理用户无zgId的情况
+     */
+    private CompletableFuture<OneIdResult> handleUserWithoutZgid(String dzHash, String deviceField,
+                                                          String uzHash, String userField,
+                                                          String zuHash) {
+        return kvrocksClient.asyncHGet(dzHash, deviceField) // 获取 did -> zgId 的映射
+                .thenCompose(zgId -> {
+                    if (zgId != null) { // did 有 zgId
+                        existIdCount.incrementAndGet();
+                        bindingCount.incrementAndGet();
+                        // did 有 zgId，将 uid 和 zgId 绑定
+                        CompletableFuture.allOf(
+                                // add: uid -> zgId
+                                kvrocksClient.asyncHSet(uzHash, userField, zgId),
+                                // add: zgId -> uid
+                                kvrocksClient.asyncHSet(zuHash, zgId, userField)
+                        );
+                        OneIdResult oneIdResult = OneIdResult.build(true, zgId);
+                        oneIdResult.addArchiveType(ArchiveType.USER_ZGID);
+                        oneIdResult.addArchiveType(ArchiveType.ZGID_USER);
+                        return CompletableFuture.completedFuture(oneIdResult);
+                    }
+                    // uid 没有对应的 zgId ，创建新zgId
+                    return createNewZgidForUserAndDevice(dzHash, deviceField, uzHash, userField, zuHash);
+                });
+    }
 
-                        return kvrocksClient.asyncHSetIfAbsent(deviceZgidHash, deviceField, newZgidStr)
-                                .thenCompose(success -> {
-                                    if (success) {
-                                        newIdCount.incrementAndGet();
-                                        return CompletableFuture.completedFuture(newZgid);
-                                    } else {
-                                        conflictCount.incrementAndGet();
-                                        return kvrocksClient.asyncHGet(deviceZgidHash, deviceField)
-                                                .thenApply(id -> {
-                                                    try {
-                                                        return id != null ? Long.parseLong(id) : null;
-                                                    } catch (NumberFormatException e) {
-                                                        return null;
-                                                    }
-                                                });
+
+    /**
+     * 创建新zgId（用户+设备）
+     * 写入映射关系
+     *
+     * @param dzHash
+     * @param deviceField
+     * @param uzHash
+     * @param userField
+     * @param zuHash
+     * @return
+     */
+    private CompletableFuture<OneIdResult> createNewZgidForUserAndDevice(String dzHash, String deviceField,
+                                                                  String uzHash, String userField,
+                                                                  String zuHash) {
+        Long newZgid = idGenerator.nextId();
+        String newZgidStr = String.valueOf(newZgid);
+        newIdCount.incrementAndGet();
+
+        return kvrocksClient
+                .asyncHSetIfAbsent(uzHash, userField, newZgidStr) // cas 写入 uid -> zgId
+                .thenCompose(success -> {
+                    if (success) {
+                        // 写入成功，写入id之间绑定关系
+                        CompletableFuture.allOf(
+                                // add: zgId -> uid
+                                kvrocksClient.asyncHSet(zuHash, newZgidStr, userField),
+                                // add: did -> zgId
+                                kvrocksClient.asyncHSet(dzHash, deviceField, newZgidStr)
+                        );
+                        // 制作返回结果
+                        OneIdResult oneIdResult = OneIdResult.build(true, newZgid);
+                        oneIdResult.addArchiveType(ArchiveType.USER_ZGID);
+                        oneIdResult.addArchiveType(ArchiveType.ZGID_USER);
+                        oneIdResult.addArchiveType(ArchiveType.DEVICE_ZGID);
+                        return CompletableFuture.completedFuture(oneIdResult);
+                    }
+                    // 冲突：获取实际zgId并绑定设备
+                    // 并发环境下，可能有其他的线程 写入了 uid -> zgId 的映射，此时使用这个 zgId ，当前线程产生的 zgId 就丢弃掉
+                    conflictCount.incrementAndGet();
+                    return kvrocksClient
+                            .asyncHGet(uzHash, userField)
+                            .thenCompose(
+                                    actualZgid -> {
+                                        // 写入 did -> zgId , 此时 (uid -> zgId) (zgId -> uid) 已经被其他线程写入了
+                                        kvrocksClient.asyncHSet(dzHash, deviceField, actualZgid);
+                                        OneIdResult oneIdResult = OneIdResult.build(true, actualZgid);
+                                        oneIdResult.addArchiveType(ArchiveType.DEVICE_ZGID);
+                                        return CompletableFuture.completedFuture(oneIdResult);
                                     }
-                                });
-                    });
+                            );
+                });
+    }
+
+
+    /**
+     * 安全解析Long，失败返回null
+     */
+    private Long parseLongSafe(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (NumberFormatException e) {
+            LOG.warn("Invalid zgId format: {}", value);
+            return null;
         }
     }
 

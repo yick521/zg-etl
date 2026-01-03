@@ -21,10 +21,10 @@ import java.util.UUID;
  * 自定义Kafka Sink - 完全避免JMX冲突
  *
  * 核心修复：
- * 1. ✅ 不使用 FlinkKafkaProducer（它会使用算子名称生成ID）
- * 2. ✅ 手动生成合法的 client.id 和 transactional.id（无特殊字符）
- * 3. ✅ 支持 At-Least-Once 语义
- * 4. ✅ 可选的 Exactly-Once 语义（通过 Checkpoint）
+ * 1.  不使用 FlinkKafkaProducer（它会使用算子名称生成ID）
+ * 2.  手动生成合法的 client.id 和 transactional.id（无特殊字符）
+ * 3.  支持 At-Least-Once 语义
+ * 4.  可选的 Exactly-Once 语义（通过 Checkpoint）
  */
 public class CustomKafkaSink extends RichSinkFunction<String> implements CheckpointedFunction {
 
@@ -59,7 +59,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
         Properties props = new Properties();
         props.setProperty(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers);
 
-        // ✅ 核心修复：手动生成合法的 client.id（只包含字母、数字、连字符、下划线）
+        //  核心修复：手动生成合法的 client.id（只包含字母、数字、连字符、下划线）
         String clientId = String.format("kafka-producer-%s-%s", subtaskIndex, UUID.randomUUID().toString().substring(0, 8));
         props.setProperty(ProducerConfig.CLIENT_ID_CONFIG, clientId);
 
@@ -94,7 +94,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
             props.setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true");
             props.setProperty(ProducerConfig.TRANSACTION_TIMEOUT_CONFIG, "300000");
 
-            // ✅ 生成合法的 transactional.id（只包含合法字符）
+            //  生成合法的 transactional.id（只包含合法字符）
             String transactionalId = String.format("kafka-txn-%d-%s",
                     subtaskIndex,
                     UUID.randomUUID().toString().substring(0, 8));
@@ -109,12 +109,12 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
 
             if (enableExactlyOnce) {
                 producer.initTransactions();
-                // ✅ 关键修复：立即开始第一个事务
+                //  关键修复：立即开始第一个事务
                 producer.beginTransaction();
-                LOG.info("[CustomKafkaSink-{}] ✅ 事务初始化并开始第一个事务", subtaskIndex);
+                LOG.info("[CustomKafkaSink-{}]  事务初始化并开始第一个事务", subtaskIndex);
             }
 
-            LOG.info("[CustomKafkaSink-{}] ✅ Kafka Producer 初始化成功", subtaskIndex);
+            LOG.info("[CustomKafkaSink-{}]  Kafka Producer 初始化成功", subtaskIndex);
             LOG.info("========================================");
 
         } catch (Exception e) {
@@ -170,7 +170,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
                 new ListStateDescriptor<>("pending-records", String.class);
         pendingRecordsState = context.getOperatorStateStore().getListState(descriptor);
 
-        // ✅ 不在这里操作 producer，因为此时 producer 还是 null
+        //  不在这里操作 producer，因为此时 producer 还是 null
         // 事务会在 open() 方法中开始
     }
 
@@ -188,7 +188,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
 
                 producer.flush();
                 producer.close();
-                LOG.info("[CustomKafkaSink-{}] ✅ Kafka Producer 已关闭", subtaskIndex);
+                LOG.info("[CustomKafkaSink-{}]  Kafka Producer 已关闭", subtaskIndex);
 
             } catch (Exception e) {
                 LOG.error("[CustomKafkaSink-{}] 关闭失败: {}", subtaskIndex, e.getMessage(), e);
@@ -214,7 +214,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
         LOG.info("========================================\n");
 
         stream.addSink(new CustomKafkaSink(topic, brokers, enableExactlyOnce))
-                .name("CustomKafkaOutput")  // ✅ 自定义名称，不影响client.id
+                .name("CustomKafkaOutput")  //  自定义名称，不影响client.id
                 .uid("custom-kafka-sink");
     }
 
@@ -241,7 +241,7 @@ public class CustomKafkaSink extends RichSinkFunction<String> implements Checkpo
         LOG.info("========================================\n");
 
         stream.addSink(new CustomKafkaSink(topic, brokers, enableExactlyOnce))
-                .name(uid)  // ✅ 自定义名称，不影响client.id
+                .name(uid)  //  自定义名称，不影响client.id
                 .uid(uid);
     }
 }

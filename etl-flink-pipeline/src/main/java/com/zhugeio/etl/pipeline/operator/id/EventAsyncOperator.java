@@ -1,7 +1,5 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONArray;
-import com.alibaba.fastjson2.JSONObject;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.zhugeio.etl.common.cache.CacheConfig;
@@ -27,37 +25,29 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 事件处理算子 - 改造版
- * 
- * 改造点:
- * 1. 移除独立的本地缓存，使用统一的 ConfigCacheService
- * 2. Key/Field 格式与 cache-sync 同步服务保持一致
- * 3. 黑名单查询从 Hash 改为 Set (asyncSIsMember)
- * 
- * KVRocks Key 对照 (与同步服务一致):
- * - appIdEventIdMap (Hash): field=appId_owner_eventName
- * - blackEventIdSet (Set): member=eventId
- * - appIdCreateEventForbidSet (Set): member=appId
- * - appIdNoneAutoCreateSet (Set): member=appId
- * - eventIdPlatform (Set): member=eventId_platform
+ * 事件处理算子 - 修复版
+ *
+ * 修复点:
+ * 1. 数据结构: 从 data.data 列表读取，而不是 data.ea
+ * 2. 事件名: 从 pr.$eid 读取，而不是 event.en
+ * 3. 写入 $zg_eid: 将 eventId 写入 pr 属性 Map
+ * 4. 设置 ZGMessage.zgEid: 设置消息对象的 zgEid 字段
+ * 5. owner 处理: 根据 dt 类型动态确定 owner（abp 固定用 "zg"）
  */
 public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(EventAsyncOperator.class);
 
     private static final int MAX_EVENT_NAME_LENGTH = 100;
-    private static final int MAX_EVENT_PER_APP = 10000;
     private static final long LOCK_WAIT_MS = 3000L;
     private static final long LOCK_EXPIRE_MS = 10000L;
 
-    // 使用统一缓存服务
     private transient ConfigCacheService cacheService;
     private transient KvrocksClient kvrocksClient;
     private transient HikariDataSource dataSource;
     private transient OperatorMetrics metrics;
     private transient LockManager lockManager;
 
-    // 统计
     private transient AtomicLong newEventCount;
     private transient AtomicLong lockWaitCount;
 
@@ -74,8 +64,8 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         this(cacheConfig, dbProperties, maxEventNameLength, 60);
     }
 
-    public EventAsyncOperator(CacheConfig cacheConfig, Properties dbProperties, 
-                               int maxEventNameLength, int metricsInterval) {
+    public EventAsyncOperator(CacheConfig cacheConfig, Properties dbProperties,
+                              int maxEventNameLength, int metricsInterval) {
         this.cacheConfig = cacheConfig;
         this.dbProperties = dbProperties;
         this.maxEventNameLength = maxEventNameLength;
@@ -90,7 +80,6 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
                 metricsInterval
         );
 
-        // 获取统一缓存服务 (单例)
         cacheService = CacheServiceFactory.getInstance(cacheConfig);
         kvrocksClient = cacheService.getKvrocksClient();
 
@@ -103,7 +92,7 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         newEventCount = new AtomicLong(0);
         lockWaitCount = new AtomicLong(0);
 
-        LOG.info("[EventAsyncOperator-{}] 初始化成功 (使用统一缓存服务)", 
+        LOG.info("[EventAsyncOperator-{}] 初始化成功",
                 getRuntimeContext().getIndexOfThisSubtask());
     }
 
@@ -126,6 +115,7 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         metrics.in();
 
@@ -136,7 +126,7 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         }
 
         try {
-            JSONObject data = (JSONObject) input.getData();
+            Map<String, Object> data = (Map<String, Object>) input.getData();
             if (data == null) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
@@ -144,23 +134,32 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
             }
 
             Integer appId = input.getAppId();
-            String owner = data.getString("owner");
+            // ★ 修复：从 data 中获取 owner
+            String defaultOwner = String.valueOf(data.get("owner"));
             Integer sdk = input.getSdk();
 
-            if (appId == null || appId == 0 || owner == null) {
+            if (appId == null || appId == 0) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
                 return;
             }
 
-            JSONArray eventArray = data.getJSONArray("ea");
-            if (eventArray == null || eventArray.isEmpty()) {
+            // ★★★ 修复：从 data.data 读取事件列表，而不是 data.ea ★★★
+            Object dataListObj = data.get("data");
+            if (!(dataListObj instanceof List)) {
                 metrics.out();
                 resultFuture.complete(Collections.singleton(input));
                 return;
             }
 
-            processEvents(input, data, appId, owner, sdk, eventArray, resultFuture);
+            List<Map<String, Object>> dataList = (List<Map<String, Object>>) dataListObj;
+            if (dataList.isEmpty()) {
+                metrics.out();
+                resultFuture.complete(Collections.singleton(input));
+                return;
+            }
+
+            processEvents(input, appId, defaultOwner, sdk, dataList, resultFuture);
 
         } catch (Exception e) {
             LOG.error("[EventAsyncOperator] 处理失败", e);
@@ -169,48 +168,82 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         }
     }
 
-    private void processEvents(ZGMessage input, JSONObject data, Integer appId, String owner,
-                               Integer sdk, JSONArray eventArray, ResultFuture<ZGMessage> resultFuture) {
+    @SuppressWarnings("unchecked")
+    private void processEvents(ZGMessage input, Integer appId, String defaultOwner,
+                               Integer sdk, List<Map<String, Object>> dataList,
+                               ResultFuture<ZGMessage> resultFuture) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        for (int i = 0; i < eventArray.size(); i++) {
-            JSONObject event = eventArray.getJSONObject(i);
-            String eventName = event.getString("en");
+        for (Map<String, Object> dataItem : dataList) {
+            if (dataItem == null) continue;
 
-            if (eventName == null || eventName.isEmpty()) {
+            // ★ 修复：检查 dt 类型，只处理事件类型
+            String dt = String.valueOf(dataItem.get("dt"));
+            if (!"evt".equals(dt) && !"mkt".equals(dt) && !"abp".equals(dt) && !"vtl".equals(dt)) {
                 continue;
             }
 
-            if (eventName.length() > maxEventNameLength) {
-                eventName = eventName.substring(0, maxEventNameLength);
-                event.put("en", eventName);
+            // ★ 修复：从 pr 中获取事件名
+            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
+            if (pr == null) {
+                continue;
             }
 
+            // ★★★ 修复：从 pr.$eid 读取事件名，而不是 event.en ★★★
+            Object eidObj = pr.get("$eid");
+            if (eidObj == null) {
+                continue;
+            }
+            String eventName = String.valueOf(eidObj);
+            if (eventName.isEmpty() || "null".equals(eventName)) {
+                continue;
+            }
+
+            // 截断过长的事件名
+            if (eventName.length() > maxEventNameLength) {
+                eventName = eventName.substring(0, maxEventNameLength);
+                pr.put("$eid", eventName);
+            }
+
+            // ★ 修复：根据 dt 类型确定 owner（abp 固定用 "zg"）
+            String owner = getOwner(dt, defaultOwner);
+
             String finalEventName = eventName;
+            Map<String, Object> finalPr = pr;
+            Map<String, Object> finalDataItem = dataItem;
+
             CompletableFuture<Void> future = getOrCreateEventId(appId, owner, finalEventName)
                     .thenCompose(eventId -> {
                         if (eventId == null) {
-                            event.put("result", -1);
-                            event.put("errCode", ErrorMessageEnum.EVENT_NOT_FOUND.getCode());
+                            // 事件ID获取失败，标记错误
+                            finalDataItem.put("errorCode", ErrorMessageEnum.EVENT_NOT_FOUND.getErrorCode());
+                            finalDataItem.put("errorDescribe", ErrorMessageEnum.EVENT_NOT_FOUND.getErrorMessage());
                             return CompletableFuture.completedFuture(null);
                         }
 
-                        event.put("ei", eventId);
+                        // ★★★ 关键修复：将 eventId 写入 pr.$zg_eid ★★★
+                        finalPr.put("$zg_eid", eventId);
 
-                        // 使用统一缓存服务检查黑名单
+                        // ★★★ 关键修复：设置 ZGMessage.zgEid ★★★
+                        // 注意：如果一条消息有多个事件，取第一个有效的事件ID
+                        if (input.getZgEid() == null || input.getZgEid() == 0) {
+                            input.setZgEid(eventId);
+                        }
+
+                        // 检查是否是黑名单事件
                         return cacheService.isBlackEvent(eventId)
                                 .thenCompose(isBlack -> {
                                     if (isBlack) {
-                                        event.put("result", -1);
-                                        event.put("errCode", ErrorMessageEnum.EVENT_BLACK.getCode());
+                                        finalDataItem.put("errorCode", ErrorMessageEnum.EVENT_BLACK.getErrorCode());
+                                        finalDataItem.put("errorDescribe", ErrorMessageEnum.EVENT_BLACK.getErrorMessage());
                                         return CompletableFuture.completedFuture(null);
                                     }
 
-                                    // 使用统一缓存服务检查平台
+                                    // 检查平台匹配
                                     return cacheService.checkEventPlatform(eventId, sdk)
                                             .thenAccept(platformOk -> {
                                                 if (!platformOk) {
-                                                    event.put("platformMismatch", true);
+                                                    finalDataItem.put("platformMismatch", true);
                                                 }
                                             });
                                 });
@@ -231,29 +264,37 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
                 });
     }
 
+    /**
+     * 根据数据类型获取 owner
+     * 与旧工程 EventService.scala 保持一致
+     */
+    private String getOwner(String dt, String defaultOwner) {
+        // abp 类型固定使用 "zg" 作为 owner
+        if ("abp".equals(dt)) {
+            return "zg";
+        }
+        return defaultOwner;
+    }
+
     private CompletableFuture<Integer> getOrCreateEventId(Integer appId, String owner, String eventName) {
-        // 使用统一缓存服务获取事件ID
         return cacheService.getEventId(appId, owner, eventName)
                 .thenCompose(eventId -> {
                     if (eventId != null) {
                         return CompletableFuture.completedFuture(eventId);
                     }
 
-                    // 检查是否禁用自动创建
                     return cacheService.isAutoCreateDisabled(appId)
                             .thenCompose(disabled -> {
                                 if (disabled) {
                                     return CompletableFuture.completedFuture(null);
                                 }
 
-                                // 检查是否禁止创建事件
                                 return cacheService.isCreateEventForbid(appId)
                                         .thenCompose(forbid -> {
                                             if (forbid) {
                                                 return CompletableFuture.completedFuture(null);
                                             }
 
-                                            // 使用分布式锁创建事件
                                             return createEventWithLock(appId, owner, eventName);
                                         });
                             });
@@ -270,7 +311,6 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         lockWaitCount.incrementAndGet();
 
         return lockManager.executeWithLockAsync(lockKey, LOCK_WAIT_MS, LOCK_EXPIRE_MS, () -> {
-            // 双重检查
             return cacheService.getEventId(appId, owner, eventName)
                     .thenCompose(existingId -> {
                         if (existingId != null) {
@@ -279,7 +319,7 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
                             return CompletableFuture.completedFuture(existingId);
                         }
 
-                        return CompletableFuture.supplyAsync(() -> 
+                        return CompletableFuture.supplyAsync(() ->
                                 createEventInDb(appId, owner, eventName));
                     });
         });
@@ -290,7 +330,6 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         try {
             conn = dataSource.getConnection();
 
-            // 再次查询数据库
             String selectSql = "SELECT id FROM event WHERE app_id = ? AND event_name = ? AND owner = ?";
             try (PreparedStatement stmt = conn.prepareStatement(selectSql)) {
                 stmt.setInt(1, appId);
@@ -299,20 +338,16 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
                 ResultSet rs = stmt.executeQuery();
                 if (rs.next()) {
                     int eventId = rs.getInt("id");
-                    
-                    // 更新统一缓存
+
                     cacheService.putEventIdCache(appId, owner, eventName, eventId);
-                    
-                    // 同步到 KVRocks (使用正确的 Key 格式)
                     syncEventToKVRocks(appId, owner, eventName, eventId);
                     return eventId;
                 }
             }
 
-            // 插入新事件
             String insertSql = "INSERT INTO event(app_id, event_name, owner, is_delete, is_stop) " +
                     "VALUES(?, ?, ?, 0, 0)";
-            try (PreparedStatement stmt = conn.prepareStatement(insertSql, 
+            try (PreparedStatement stmt = conn.prepareStatement(insertSql,
                     java.sql.Statement.RETURN_GENERATED_KEYS)) {
                 stmt.setInt(1, appId);
                 stmt.setString(2, eventName);
@@ -322,15 +357,12 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
                 ResultSet rs = stmt.getGeneratedKeys();
                 if (rs.next()) {
                     int eventId = rs.getInt(1);
-                    
-                    // 更新统一缓存
+
                     cacheService.putEventIdCache(appId, owner, eventName, eventId);
-                    
-                    // 同步到 KVRocks
                     syncEventToKVRocks(appId, owner, eventName, eventId);
-                    
+
                     newEventCount.incrementAndGet();
-                    LOG.info("创建事件成功: appId={}, eventName={}, eventId={}", 
+                    LOG.info("创建事件成功: appId={}, eventName={}, eventId={}",
                             appId, eventName, eventId);
                     return eventId;
                 }
@@ -348,16 +380,12 @@ public class EventAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> 
         }
     }
 
-    /**
-     * 同步事件到 KVRocks (使用与同步服务一致的 Key 格式)
-     */
     private void syncEventToKVRocks(Integer appId, String owner, String eventName, Integer eventId) {
-        // Key: appIdEventIdMap, Field: appId_owner_eventName
         String actualKey = cacheConfig.isKvrocksCluster()
                 ? "{" + CacheKeyConstants.APP_ID_EVENT_ID_MAP + "}"
                 : CacheKeyConstants.APP_ID_EVENT_ID_MAP;
         String field = CacheKeyConstants.eventIdField(appId, owner, eventName);
-        
+
         kvrocksClient.asyncHSet(actualKey, field, String.valueOf(eventId))
                 .exceptionally(ex -> {
                     LOG.warn("同步事件到KVRocks失败: appId={}, eventName={}", appId, eventName, ex);

@@ -1,5 +1,6 @@
 package com.zhugeio.etl.pipeline.main;
 
+import com.alibaba.fastjson.JSON;
 import com.zhugeio.etl.common.cache.CacheConfig;
 import com.zhugeio.etl.common.config.Config;
 import com.zhugeio.etl.common.config.FlinkEnvConfig;
@@ -244,7 +245,7 @@ public class IdJob {
         // 主流输出到下游 (DW Job)
         if (sinkToDownstream) {
             CustomKafkaSink.addCustomKafkaSink(
-                    result.map(ZGMessage::getRawData),
+                    result.map(msg -> JSON.toJSONString(msg.getData())),
                     Config.getString(Config.KAFKA_DW_SOURCE_TOPIC),
                     Config.getString(Config.KAFKA_BROKERS),
                     true,
@@ -374,7 +375,7 @@ public class IdJob {
         SideOutputDataStream<String> advConvertSideOutput = advConvertProcessed.getSideOutput(advConvertTag);
         CustomKafkaSink.addCustomKafkaSink(
                 advConvertSideOutput,
-                Config.getString("kafka.adv.sinkTopic"),
+                Config.getString(Config.getString(Config.KAFKA_ADV_SOURCE_TOPIC)),
                 Config.getString(Config.KAFKA_BROKERS),
                 true,
                 "id-advConvertEventSideOutput-sink"
@@ -383,7 +384,7 @@ public class IdJob {
         SideOutputDataStream<String> advConvertUserSideOutput = advConvertProcessed.getSideOutput(advConvertUserTag);
         CustomKafkaSink.addCustomKafkaSink(
                 advConvertUserSideOutput,
-                Config.getString("kafka.adv.user.sinkTopic"),
+                Config.getString(Config.getString(Config.KAFKA_ADV_USER_SOURCE_TOPIC)),
                 Config.getString(Config.KAFKA_BROKERS),
                 true,
                 "id-advConvertEventUserSideOutput-sink"

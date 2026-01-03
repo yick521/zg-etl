@@ -45,10 +45,10 @@ public class DwJob {
     private static final String CHECKPOINT_BASE = "hdfs:///user/flink/checkpoints/";
 
     // 异步算子默认配置
-    private static final int ASYNC_CAPACITY_IP = 500;
-    private static final int ASYNC_CAPACITY_UA = 500;
-    private static final int ASYNC_CAPACITY_KEYWORD = 500;
-    private static final int ASYNC_CAPACITY_ROUTER = 1000;
+    private static final int ASYNC_CAPACITY_IP = 100;
+    private static final int ASYNC_CAPACITY_UA = 100;
+    private static final int ASYNC_CAPACITY_KEYWORD = 100;
+    private static final int ASYNC_CAPACITY_ROUTER = 100;
 
     private static final long ASYNC_TIMEOUT_IP = 30000L;
     private static final long ASYNC_TIMEOUT_UA = 5000L;

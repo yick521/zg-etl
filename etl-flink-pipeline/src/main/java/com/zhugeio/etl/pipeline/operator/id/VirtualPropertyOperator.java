@@ -1,6 +1,6 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONObject;
+import com.alibaba.fastjson2.JSON;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.zhugeio.etl.common.cache.CacheConfig;
@@ -19,23 +19,16 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * 虚拟属性处理算子 - 改造版 (只读)
+ * 虚拟属性处理算子 - 修复版
  *
- * 改造点:
- * 1. 移除独立的本地缓存，使用统一的 ConfigCacheService
- * 2. Key/Field 格式与 cache-sync 同步服务保持一致
- *
- * KVRocks Key 对照 (与同步服务一致):
- * - virtualPropAppIdsSet (Set): member=appId - 检查应用是否有虚拟属性
- * - virtualEventPropMap (Hash): field=appId_eP_eventName - 虚拟事件属性
- * - virtualUserPropMap (Hash): field=appId - 虚拟用户属性
- * - eventVirtualAttrIdsSet (Set): member=attrId - 检查是否虚拟属性
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
  */
 public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(VirtualPropertyOperator.class);
 
-    // 使用统一缓存服务
     private transient ConfigCacheService cacheService;
     private CacheConfig cacheConfig;
 
@@ -53,15 +46,17 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
         evaluatorThreadLocal = ThreadLocal.withInitial(VirtualAttributeExpressionEvaluator::new);
         objectMapperThreadLocal = ThreadLocal.withInitial(ObjectMapper::new);
 
-        LOG.info("[VirtualPropertyOperator-{}] 初始化成功 (使用统一缓存服务)",
+        LOG.info("[VirtualPropertyOperator-{}] 初始化成功",
                 getRuntimeContext().getIndexOfThisSubtask());
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         try {
             if (input.getResult() != -1) {
-                JSONObject data = (JSONObject) input.getData();
+                //  修复: 使用 Map 方式访问数据
+                Map<String, Object> data = (Map<String, Object>) input.getData();
                 if (data == null) {
                     resultFuture.complete(Collections.singleton(input));
                     return;
@@ -73,7 +68,6 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
                     return;
                 }
 
-                // 使用统一缓存服务检查应用是否有虚拟属性
                 cacheService.hasVirtualProp(appId)
                         .thenCompose(hasVirtualProp -> {
                             if (!hasVirtualProp) {
@@ -83,22 +77,22 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
                             List<CompletableFuture<Void>> futures = new ArrayList<>();
 
                             Object dataListObj = data.get("data");
-                            if (dataListObj instanceof Iterable) {
-                                for (Object dataItemObj : (Iterable<?>) dataListObj) {
-                                    if (dataItemObj instanceof JSONObject) {
-                                        JSONObject dataItem = (JSONObject) dataItemObj;
+                            if (dataListObj instanceof List) {
+                                List<Map<String, Object>> dataList = (List<Map<String, Object>>) dataListObj;
 
-                                        String dt = dataItem.getString("dt");
-                                        JSONObject pr = dataItem.getJSONObject("pr");
+                                for (Map<String, Object> dataItem : dataList) {
+                                    if (dataItem == null) continue;
 
-                                        if (pr != null) {
-                                            if ("evt".equals(dt) || "abp".equals(dt)) {
-                                                CompletableFuture<Void> future = handleVirtualEventProps(pr, appId);
-                                                futures.add(future);
-                                            } else if ("usr".equals(dt)) {
-                                                CompletableFuture<Void> future = handleVirtualUserProps(pr, appId);
-                                                futures.add(future);
-                                            }
+                                    String dt = String.valueOf(dataItem.get("dt"));
+                                    Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
+
+                                    if (pr != null) {
+                                        if ("evt".equals(dt) || "abp".equals(dt)) {
+                                            CompletableFuture<Void> future = handleVirtualEventProps(pr, appId);
+                                            futures.add(future);
+                                        } else if ("usr".equals(dt)) {
+                                            CompletableFuture<Void> future = handleVirtualUserProps(pr, appId);
+                                            futures.add(future);
                                         }
                                     }
                                 }
@@ -128,13 +122,12 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
     /**
      * 处理虚拟事件属性
      */
-    private CompletableFuture<Void> handleVirtualEventProps(JSONObject pr, Integer appId) {
-        String eventName = pr.getString("$eid");
-        if (eventName == null) {
+    private CompletableFuture<Void> handleVirtualEventProps(Map<String, Object> pr, Integer appId) {
+        String eventName = String.valueOf(pr.get("$eid"));
+        if (eventName == null || "null".equals(eventName)) {
             return CompletableFuture.completedFuture(null);
         }
 
-        // 使用统一缓存服务获取虚拟事件属性
         return cacheService.getVirtualEventProps(appId, eventName)
                 .thenAccept(virtualProps -> {
                     if (virtualProps != null && !virtualProps.isEmpty()) {
@@ -144,7 +137,6 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
                                 String sqlJson = (String) virtualProp.get("sql_json");
 
                                 if (name != null && sqlJson != null) {
-                                    // 处理虚拟属性
                                     handleVirtualProp(name, sqlJson, pr);
                                 }
                             } catch (Exception e) {
@@ -158,8 +150,7 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
     /**
      * 处理虚拟用户属性
      */
-    private CompletableFuture<Void> handleVirtualUserProps(JSONObject pr, Integer appId) {
-        // 使用统一缓存服务获取虚拟用户属性
+    private CompletableFuture<Void> handleVirtualUserProps(Map<String, Object> pr, Integer appId) {
         return cacheService.getVirtualUserProps(appId)
                 .thenAccept(virtualProps -> {
                     if (virtualProps != null && !virtualProps.isEmpty()) {
@@ -170,9 +161,7 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
                                 String tableFields = (String) virtualProp.get("table_fields");
 
                                 if (name != null && sqlJson != null) {
-                                    // 检查是否包含所有必要字段
                                     if (isAllProp(tableFields, pr)) {
-                                        // 处理虚拟属性
                                         handleVirtualProp(name, sqlJson, pr);
                                     }
                                 }
@@ -187,7 +176,7 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
     /**
      * 判断当前数据中是否包含所有虚拟属性字段
      */
-    private boolean isAllProp(String tableFields, JSONObject pr) {
+    private boolean isAllProp(String tableFields, Map<String, Object> pr) {
         if (tableFields == null || tableFields.isEmpty()) {
             return false;
         }
@@ -207,17 +196,17 @@ public class VirtualPropertyOperator extends RichAsyncFunction<ZGMessage, ZGMess
     }
 
     /**
-     * 处理单个虚拟属性 (与原始代码保持一致)
+     * 处理单个虚拟属性
      */
-    private void handleVirtualProp(String virtualPropName, String virtualPropRule, JSONObject pr) {
+    private void handleVirtualProp(String virtualPropName, String virtualPropRule, Map<String, Object> pr) {
         try {
             VirtualAttributeExpressionEvaluator evaluator = evaluatorThreadLocal.get();
             ObjectMapper mapper = objectMapperThreadLocal.get();
 
-            String jsonData = pr.toJSONString();
+            // 将 Map 转为 JSON 字符串再解析
+            String jsonData = JSON.toJSONString(pr);
             JsonNode jsonNode = mapper.readTree(jsonData);
 
-            // 调用 evaluator.evaluate(sqlJson, JsonNode)
             Object value = evaluator.evaluate(virtualPropRule, jsonNode);
 
             Object convertedValue = convertValue(value);

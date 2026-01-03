@@ -8,6 +8,8 @@ import com.zhugeio.etl.common.cache.ConfigCacheService;
 import com.zhugeio.etl.pipeline.enums.ErrorMessageEnum;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.common.util.Dims;
+import com.zhugeio.etl.common.lock.LockManager;
+import com.zhugeio.etl.common.client.kvrocks.KvrocksClient;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.async.ResultFuture;
 import org.apache.flink.streaming.api.functions.async.RichAsyncFunction;
@@ -20,14 +22,15 @@ import java.sql.SQLException;
 import java.util.Collections;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 /**
  * 设置AppId和Business算子 - 改造版
- * 
+ * <p>
  * 改造点:
  * 1. 移除独立的本地缓存，使用统一的 ConfigCacheService
  * 2. Key/Field 格式与 cache-sync 同步服务保持一致
- * 
+ * <p>
  * KVRocks Key 对照 (与同步服务一致):
  * - appKeyAppIdMap (Hash): field=appKey
  * - cidByAidMap (Hash): field=appId
@@ -40,8 +43,9 @@ public class SetAppIdAndBusinessOperator extends RichAsyncFunction<ZGMessage, ZG
     // 使用统一缓存服务
     private transient ConfigCacheService cacheService;
     private transient HikariDataSource dataSource;
+    private transient LockManager lockManager;
 
-    private CacheConfig cacheConfig;
+    private final CacheConfig cacheConfig;
     private final Properties dbProperties;
 
     public SetAppIdAndBusinessOperator(CacheConfig cacheConfig) {
@@ -56,6 +60,8 @@ public class SetAppIdAndBusinessOperator extends RichAsyncFunction<ZGMessage, ZG
     @Override
     public void open(Configuration parameters) throws Exception {
         cacheService = CacheServiceFactory.getInstance(cacheConfig);
+        KvrocksClient kvrocksClient = cacheService.getKvrocksClient();
+        lockManager = new LockManager(kvrocksClient);
 
         if (dbProperties != null && dbProperties.containsKey("rdbms.url")) {
             initializeConnectionPool(parameters);
@@ -97,15 +103,29 @@ public class SetAppIdAndBusinessOperator extends RichAsyncFunction<ZGMessage, ZG
                                 .thenCompose(hasData -> {
                                     // 异步写入MySQL（如果没有数据）
                                     if (!hasData && dataSource != null) {
-                                        CompletableFuture.runAsync(() -> writeToMysql(appId, plat));
+                                        String lockKey = lockManager.appSdkLockKey(appId, plat);
+                                        Supplier<CompletableFuture<Void>> writeOperation = () -> {
+                                            CompletableFuture<Void> future = new CompletableFuture<>();
+                                            try {
+                                                writeToMysql(appId, plat);
+                                                future.complete(null);
+                                            } catch (Exception e) {
+                                                LOG.error("写入MySQL失败: appId={}, platform={}", appId, plat, e);
+                                                future.completeExceptionally(e);
+                                            }
+                                            return future;
+                                        };
+                                        
+                                        lockManager.executeWithLockAsync(lockKey, writeOperation)
+                                                .exceptionally(ex -> {
+                                                    LOG.error("获取锁或写入MySQL失败: appId={}, platform={}", appId, plat, ex);
+                                                    return null;
+                                                });
                                     }
 
                                     // 获取 companyId
                                     return cacheService.getCompanyIdByAppId(appId)
-                                            .thenApply(companyId -> {
-                                                ZGMessage output = createOutput(input, appId, companyId);
-                                                return output;
-                                            });
+                                            .thenApply(companyId -> createOutput(input, appId));
                                 });
                     } else {
                         ZGMessage output = createErrorOutput(input);
@@ -160,7 +180,7 @@ public class SetAppIdAndBusinessOperator extends RichAsyncFunction<ZGMessage, ZG
         }
     }
 
-    private ZGMessage createOutput(ZGMessage input, Integer appId, Integer companyId) {
+    private ZGMessage createOutput(ZGMessage input, Integer appId) {
         String business = input.getData().getOrDefault("business", "").toString();
 
         ZGMessage output = new ZGMessage();

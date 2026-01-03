@@ -72,7 +72,7 @@ public class UserPropertyTransfer implements Serializable {
         
         long timestamp = Timestamp.valueOf(time).getTime() / 1000;
         
-        // ✅ 优化: 使用 join() 而不是 get()，有本地缓存时不会阻塞
+        //  优化: 使用 join() 而不是 get()，有本地缓存时不会阻塞
         boolean cdpMode = isCdpEnabled(appId);
         
         // 处理自定义属性 (以 "_" 开头)

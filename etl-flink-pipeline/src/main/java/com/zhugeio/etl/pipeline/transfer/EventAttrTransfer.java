@@ -150,6 +150,8 @@ public class EventAttrTransfer implements Serializable {
     private void fillCustomPropertiesBatch(EventAttrRow row, Map<String, Object> pr, String dt, String zgEid) {
         Set<String> attrSet = getAttrSet(dt);
 
+        int customColumns = EventAttrRow.getCustomColumns();
+
         // Step 1: 收集所有需要查询的属性
         List<CustomPropQuery> queries = new ArrayList<>();
 
@@ -196,7 +198,7 @@ public class EventAttrTransfer implements Serializable {
             try {
                 Integer colIndex = futures.get(i).join();
 
-                if (colIndex != null && colIndex >= 1 && colIndex <= 100) {
+                if (colIndex != null && colIndex >= 1 && colIndex <= customColumns) {
                     CustomPropQuery query = queries.get(i);
                     String propValue = ensureLength(getStringValue(pr, query.key), eventAttrLengthLimit);
                     row.setCustomProperty(colIndex, propValue);

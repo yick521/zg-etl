@@ -1,13 +1,21 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONArray;
-import com.alibaba.fastjson2.JSONObject;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.util.Collector;
 
+import java.math.BigDecimal;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
+/**
+ * 会话ID处理算子 - 修复版
+ *
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
+ */
 public class SessionIdProcessOperator extends ProcessFunction<ZGMessage, ZGMessage> {
 
     @Override
@@ -20,67 +28,68 @@ public class SessionIdProcessOperator extends ProcessFunction<ZGMessage, ZGMessa
         }
     }
 
+    @SuppressWarnings("unchecked")
     private ZGMessage createOutput(ZGMessage input) {
-        // input.getData() 返回的是整个消息体 Map/JSONObject，其中包含 "data" 数组
         Object dataObj = input.getData();
 
         if (dataObj == null) {
             return input;
         }
 
-        JSONArray dataArray = null;
-
-        // 处理不同的数据类型
-        if (dataObj instanceof JSONObject) {
-            JSONObject dataJson = (JSONObject) dataObj;
-            dataArray = dataJson.getJSONArray("data");
-        } else if (dataObj instanceof java.util.Map) {
-            // 如果是 Map 类型，先转换为 JSONObject
-            @SuppressWarnings("unchecked")
-            java.util.Map<String, Object> dataMap = (java.util.Map<String, Object>) dataObj;
-            Object innerData = dataMap.get("data");
-            if (innerData instanceof JSONArray) {
-                dataArray = (JSONArray) innerData;
-            } else if (innerData instanceof java.util.List) {
-                // 如果是 List，转换为 JSONArray
-                dataArray = new JSONArray((java.util.List<?>) innerData);
-                dataMap.put("data", dataArray);  // 更新回去
-            }
-        }
-
-        if (dataArray == null) {
+        // 修复: 使用 Map 方式访问数据
+        if (!(dataObj instanceof Map)) {
             return input;
         }
 
+        Map<String, Object> dataMap = (Map<String, Object>) dataObj;
+        Object innerData = dataMap.get("data");
+
+        if (!(innerData instanceof List)) {
+            return input;
+        }
+
+        List<Map<String, Object>> dataArray = (List<Map<String, Object>>) innerData;
+
         // 遍历 data 数组中的每个元素
-        for (int i = 0; i < dataArray.size(); i++) {
-            JSONObject item = dataArray.getJSONObject(i);
+        for (Map<String, Object> item : dataArray) {
             if (item == null) {
                 continue;
             }
 
             // 获取 pr 对象
             Object prObj = item.get("pr");
-            if (prObj instanceof JSONObject) {
-                JSONObject pr = (JSONObject) prObj;
+            if (prObj instanceof Map) {
+                Map<String, Object> pr = (Map<String, Object>) prObj;
 
                 // 处理 $sid -> $zg_sid
                 if (pr.containsKey("$sid")) {
-                    pr.put("$zg_sid", pr.getLongValue("$sid"));
+                    pr.put("$zg_sid", parseSidToLong(pr.get("$sid")));
                 } else {
                     pr.put("$zg_sid", -1L);
                 }
-            }
 
-            // 为特定事件类型添加 UUID
-            String dt = item.getString("dt");
-            if ("evt".equals(dt) || "ss".equals(dt) || "se".equals(dt) ||
-                    "mkt".equals(dt) || "abp".equals(dt)) {
-                item.put("$uuid", generateUUID());
+                // 为特定事件类型添加 UUID
+                String dt = (String) item.get("dt");
+                if ("evt".equals(dt) || "ss".equals(dt) || "se".equals(dt) ||
+                        "mkt".equals(dt) || "abp".equals(dt)) {
+                    // 将 UUID 添加到 pr 中
+                    pr.put("$uuid", generateUUID());
+                }
             }
         }
 
         return input;
+    }
+
+    private Long parseSidToLong(Object sidValue) {
+        if (sidValue == null) {
+            return -1L;
+        }
+        try {
+            return new BigDecimal(sidValue.toString()).longValue();
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
     }
 
     private String generateUUID() {

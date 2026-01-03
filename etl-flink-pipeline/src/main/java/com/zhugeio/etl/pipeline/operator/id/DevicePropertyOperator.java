@@ -1,6 +1,5 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONObject;
 import com.zhugeio.etl.common.cache.CacheConfig;
 import com.zhugeio.etl.common.cache.CacheServiceFactory;
 import com.zhugeio.etl.common.cache.ConfigCacheService;
@@ -15,25 +14,19 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 设备属性处理算子 - 改造版 (只读)
+ * 设备属性处理算子 - 修复版
  * 
- * 改造点:
- * 1. 移除独立的本地缓存，使用统一的 ConfigCacheService
- * 2. Key/Field 格式与 cache-sync 同步服务保持一致
- * 
- * KVRocks Key 对照 (与同步服务一致):
- * - appIdDevicePropIdMap (Hash): field=appId_owner_propName
- * - devicePropPlatform (Set): member=propId_platform
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
  */
 public class DevicePropertyOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
     private static final Logger LOG = LoggerFactory.getLogger(DevicePropertyOperator.class);
     private static final int MAX_DEV_ATTR_LENGTH = Config.getInt("max_dev_prop_length");
 
-    // 使用统一缓存服务
     private transient ConfigCacheService cacheService;
 
     private CacheConfig cacheConfig;
@@ -46,39 +39,40 @@ public class DevicePropertyOperator extends RichAsyncFunction<ZGMessage, ZGMessa
     public void open(Configuration parameters) {
         cacheService = CacheServiceFactory.getInstance(cacheConfig);
 
-        LOG.info("[DevicePropertyOperator-{}] 初始化成功 (使用统一缓存服务)",
+        LOG.info("[DevicePropertyOperator-{}] 初始化成功",
                 getRuntimeContext().getIndexOfThisSubtask());
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         try {
             if (input.getResult() != -1) {
-                JSONObject data = (JSONObject) input.getData();
+                //  修复: 使用 Map 方式访问数据
+                Map<String, Object> data = (Map<String, Object>) input.getData();
                 if (data == null) {
                     resultFuture.complete(Collections.singleton(input));
                     return;
                 }
 
                 Integer appId = input.getAppId();
-                String owner = data.getString("owner");
+                String owner = String.valueOf(data.get("owner"));
                 Integer sdk = Dims.sdk(String.valueOf(data.get("pl")));
 
                 Object dataListObj = data.get("data");
-                if (dataListObj instanceof Iterable) {
+                if (dataListObj instanceof List) {
                     List<CompletableFuture<Void>> futures = new ArrayList<>();
+                    List<Map<String, Object>> dataList = (List<Map<String, Object>>) dataListObj;
 
-                    for (Object dataItemObj : (Iterable<?>) dataListObj) {
-                        if (dataItemObj instanceof JSONObject) {
-                            JSONObject dataItem = (JSONObject) dataItemObj;
+                    for (Map<String, Object> dataItem : dataList) {
+                        if (dataItem == null) continue;
 
-                            // 只处理设备属性类型(dt=pl)
-                            if ("pl".equals(dataItem.getString("dt"))) {
-                                JSONObject pr = dataItem.getJSONObject("pr");
-                                if (pr != null) {
-                                    CompletableFuture<Void> future = handleCustomProps(pr, appId, owner, sdk);
-                                    futures.add(future);
-                                }
+                        // 只处理设备属性类型(dt=pl)
+                        if ("pl".equals(dataItem.get("dt"))) {
+                            Map<String, Object> pr = (Map<String, Object>) dataItem.get("pr");
+                            if (pr != null) {
+                                CompletableFuture<Void> future = handleCustomProps(pr, appId, owner, sdk);
+                                futures.add(future);
                             }
                         }
                     }
@@ -106,15 +100,16 @@ public class DevicePropertyOperator extends RichAsyncFunction<ZGMessage, ZGMessa
     /**
      * 处理自定义属性
      */
-    private CompletableFuture<Void> handleCustomProps(JSONObject pr, Integer appId, String owner, Integer sdk) {
+    private CompletableFuture<Void> handleCustomProps(Map<String, Object> pr, Integer appId, 
+                                                       String owner, Integer sdk) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        for (Map.Entry<String, Object> entry : new HashSet<>(pr.entrySet())) {
-            String key = entry.getKey();
+        for (String key : new HashSet<>(pr.keySet())) {
             if (key.startsWith("_")) {
                 String propName = key.substring(1).trim();
+                Object propValue = pr.get(key);
 
-                String propType = getObjectType(entry.getValue());
+                String propType = getObjectType(propValue);
 
                 if ("null".equals(propType)) {
                     pr.remove(key);
@@ -127,11 +122,9 @@ public class DevicePropertyOperator extends RichAsyncFunction<ZGMessage, ZGMessa
                 final String finalKey = key;
                 final String finalPropName = propName;
 
-                // 使用统一缓存服务获取设备属性ID
                 CompletableFuture<Void> future = cacheService.getDevicePropId(appId, owner, propName)
                         .thenCompose(propId -> {
                             if (propId != null) {
-                                // 检查平台
                                 return cacheService.checkDevicePropPlatform(propId, sdk)
                                         .thenAccept(valid -> {
                                             if (valid) {

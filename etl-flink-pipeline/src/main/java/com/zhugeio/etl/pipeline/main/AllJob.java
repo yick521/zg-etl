@@ -48,6 +48,10 @@ public class AllJob {
         // 实现数据在内存传递，无中间Kafka
         DataStream<ZGMessage> gateResult = GateJob.execute(env);
         DataStream<ZGMessage> idResult = IdJob.execute(gateResult);
+//        DataStream<ZGMessage> printedStream = idResult.map(message -> {
+//            LOG.info("ZGMessage内容: {}", message.toString());
+//            return message;
+//        }).name("print-message").setParallelism(1);
         DwJob.execute(idResult);
 
         try {

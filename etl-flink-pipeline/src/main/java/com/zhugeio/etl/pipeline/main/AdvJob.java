@@ -1,19 +1,16 @@
 package com.zhugeio.etl.pipeline.main;
 
 import com.zhugeio.etl.common.config.Config;
+import com.zhugeio.etl.common.config.FlinkEnvConfig;
 import com.zhugeio.etl.common.sink.DorisSinkBuilder;
 import com.zhugeio.etl.common.sink.JsonSerializerFactory;
 import com.zhugeio.etl.pipeline.entity.ZGMessage;
 import com.zhugeio.etl.pipeline.kafka.ZGMsgSchema;
 import com.zhugeio.etl.pipeline.model.ToufangAdClickRow;
 import com.zhugeio.etl.pipeline.model.ToufangConvertEventRow;
-import com.zhugeio.etl.pipeline.operator.adv.AdvFlatMapFunction;
 import com.zhugeio.etl.pipeline.operator.adv.AdvProcessFunction;
-import com.zhugeio.etl.pipeline.operator.gate.GateFlatMapFunction;
-import com.zhugeio.tool.properties.PropertiesUtil;
 import org.apache.doris.flink.sink.writer.serializer.DorisRecordSerializer;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
-import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.runtime.state.hashmap.HashMapStateBackend;
@@ -36,12 +33,18 @@ import java.util.Properties;
  */
 public class AdvJob {
     private static final Logger logger = LoggerFactory.getLogger(AdvJob.class);
+    private static final String CHECKPOINT_BASE = "hdfs:///user/flink/checkpoints/";
+
     public static void main(String[] args) {
         // 读取配置
-        Properties configProperties = PropertiesUtil.getProperties("config.properties");
-        logger.info("configProperties : {}",configProperties);
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        initCheckpoint(env,configProperties);
+
+        // Checkpoint 配置
+        String checkpointPath = CHECKPOINT_BASE + Config.getString(Config.CHECKPOINT_ID_PATH, "adv_job");
+        FlinkEnvConfig.configureCheckpoint(env, Config.getLong(Config.FLINK_CHECKPOINT_INTERVAL_MS, 30000L), checkpointPath);
+
+        env.getCheckpointConfig().enableUnalignedCheckpoints();
+        env.getCheckpointConfig().setCheckpointTimeout(120000L);
         int parallelism = env.getParallelism();  // 提交任务的命令中指定的全局并行度
         logger.info("parallelism : {}",parallelism);
         String feNodes = Config.getString(Config.DORIS_FE_NODES);
@@ -51,11 +54,11 @@ public class AdvJob {
 
         // 1. 创建 KafkaSource，使用自定义反序列化模式获取分区信息
         KafkaSource<ZGMessage> kafkaSource = KafkaSource.<ZGMessage>builder()
-                .setBootstrapServers(configProperties.getProperty("kafka.brokers"))
-                .setTopics(configProperties.getProperty("kafka.adv.sinkTopic"))
-                .setGroupId(configProperties.getProperty("kafka.adv.group.id"))
+                .setBootstrapServers(Config.getString(Config.KAFKA_BROKERS))
+                .setTopics(Config.getString(Config.KAFKA_ADV_SOURCE_TOPIC))
+                .setGroupId(Config.getString(Config.KAFKA_ADV_GROUP_ID))
                 .setStartingOffsets(OffsetsInitializer.committedOffsets(OffsetResetStrategy.EARLIEST)) // 优先用已提交偏移量，没有则从最早开始
-                .setProperties(getRateLimitProperties(configProperties)) // 关键：添加 Kafka Consumer 配置来控制消费速率
+                .setProperties(Config.getKafkaConsumerProps()) // 关键：添加 Kafka Consumer 配置来控制消费速率
                 .setDeserializer(new ZGMsgSchema()) // 关键：解析POJO
                 .build();
 
@@ -66,12 +69,9 @@ public class AdvJob {
                 "Kafka-source-adv"
         ).uid("Kafka-source-adv");
 
-        SingleOutputStreamOperator<ZGMessage> flatMapStream = stream.flatMap(new GateFlatMapFunction(configProperties));
-
 
         final OutputTag<ToufangAdClickRow> advClickOutputTag = new OutputTag<ToufangAdClickRow>("advClick"){};
-
-        SingleOutputStreamOperator<ToufangConvertEventRow> toufangConvertEventRowDataStream = flatMapStream.process(new AdvProcessFunction(advClickOutputTag));
+        SingleOutputStreamOperator<ToufangConvertEventRow> toufangConvertEventRowDataStream = stream.process(new AdvProcessFunction(advClickOutputTag));
         SideOutputDataStream<ToufangAdClickRow> sideOutputDataStream = toufangConvertEventRowDataStream.getSideOutput(advClickOutputTag);
         // 1.
         DorisRecordSerializer<ToufangConvertEventRow> eventSerializer =
@@ -79,7 +79,7 @@ public class AdvJob {
         DorisSinkBuilder.<ToufangConvertEventRow>builder()
                 .feNodes(feNodes)
                 .database(database)
-                .table(configProperties.getProperty("adv.sink.event.table"))
+                .table(Config.getString(Config.ADV_SINK_EVENT_TABLE))
                 .username(username)
                 .password(password)
                 .partialUpdate()
@@ -91,7 +91,7 @@ public class AdvJob {
         DorisSinkBuilder.<ToufangAdClickRow>builder()
                 .feNodes(feNodes)
                 .database(database)
-                .table(configProperties.getProperty("adv.sink.click.table"))
+                .table(Config.getString(Config.ADV_SINK_CLICK_TABLE))
                 .username(username)
                 .password(password)
                 .partialUpdate()
@@ -103,40 +103,5 @@ public class AdvJob {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-    }
-
-    /**
-     *
-     * @param env
-     * @param properties
-     */
-    public static void initCheckpoint(StreamExecutionEnvironment env, Properties properties){
-        env.enableCheckpointing(Integer.parseInt(properties.getProperty("checkpoint.gate.interval")));
-        env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
-        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
-        env.getCheckpointConfig().setTolerableCheckpointFailureNumber(10);
-        // 1. 设置状态后端
-        env.setStateBackend(new HashMapStateBackend());
-
-        // 2. 设置Checkpoint存储（文件系统）
-        String checkpointPath = "hdfs:///user/flink/checkpoints/"+properties.getProperty("checkpoint.gate.path");
-        env.getCheckpointConfig().setCheckpointStorage(checkpointPath);
-        //            env.setStateBackend(new RocksDBStateBackend("hdfs:///user/flink/checkpoints/"+properties.getProperty("checkpoint.gate.path"), true));
-    }
-
-    /**
-     * 专门设置速率限制属性的方法
-     * @param configProperties
-     * @return
-     */
-    private static Properties getRateLimitProperties(Properties configProperties) {
-        Properties props = new Properties();
-        // 每个分区fetch最大字节
-        props.setProperty("max.partition.fetch.bytes", configProperties.getProperty("kafka.max.partition.fetch.bytes"));
-        // 每次poll最大记录数
-        props.setProperty("max.poll.records", configProperties.getProperty("kafka.max.poll.records"));
-        // 服务器等待时间
-        props.setProperty("fetch.max.wait.ms", configProperties.getProperty("kafka.fetch.max.wait.ms"));
-        return props;
     }
 }

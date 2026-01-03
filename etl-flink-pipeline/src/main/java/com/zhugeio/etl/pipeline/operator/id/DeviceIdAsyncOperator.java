@@ -1,7 +1,5 @@
 package com.zhugeio.etl.pipeline.operator.id;
 
-import com.alibaba.fastjson2.JSONArray;
-import com.alibaba.fastjson2.JSONObject;
 import com.zhugeio.etl.common.cache.CacheConfig;
 import com.zhugeio.etl.common.cache.CacheServiceFactory;
 import com.zhugeio.etl.pipeline.service.OneIdService;
@@ -17,19 +15,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 /**
- * 设备ID异步映射算子 (优化版)
+ * 设备ID异步映射算子 - 修复版
  * 
- * ✅ 优化点:
- * 1. 使用 OneIdService 统一ID管理
- * 2. 使用 Hash 结构存储，与原 Scala 一致
- * 3. 使用雪花算法生成ID
- * 4. 通过 CacheServiceFactory 管理单例
- * 5. 集成 OperatorMetrics 监控
- * 
- * Hash结构: device_id:{appId} field={deviceMd5} value={zgDeviceId}
+ * 修复点:
+ * 1. 使用 Map<String, Object> 访问数据，而非强转 JSONObject
+ * 2. 与 UserPropAsyncOperator 保持一致的数据访问方式
  */
 public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessage> {
 
@@ -65,13 +60,13 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
 
     @Override
     public void open(Configuration parameters) throws Exception {
-        // 初始化 Metrics
         metrics = OperatorMetrics.create(
                 getRuntimeContext().getMetricGroup(),
                 "device_id_" + getRuntimeContext().getIndexOfThisSubtask(),
                 metricsInterval
         );
 
+        OneIdService.initialize(kvrocksHost, kvrocksPort, kvrocksCluster);
         oneIdService = OneIdService.getInstance();
 
         LOG.info("[DeviceIdAsyncOperator-{}] 初始化成功, KVRocks: {}:{}, workerId={}",
@@ -79,6 +74,7 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public void asyncInvoke(ZGMessage input, ResultFuture<ZGMessage> resultFuture) {
         metrics.in();
 
@@ -90,7 +86,8 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
         }
 
         try {
-            JSONObject data = (JSONObject) input.getData();
+            //  修复: 使用 Map 方式访问数据
+            Map<String, Object> data = (Map<String, Object>) input.getData();
             if (data == null) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
@@ -98,15 +95,15 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
             }
 
             // 获取设备标识
-            JSONObject usr = data.getJSONObject("usr");
+            Map<String, Object> usr = (Map<String, Object>) data.get("usr");
             if (usr == null) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
                 return;
             }
 
-            String did = usr.getString("did");
-            if (StringUtils.isBlank(did)) {
+            String did = String.valueOf(usr.get("did"));
+            if (StringUtils.isBlank(did) || "null".equals(did)) {
                 metrics.skip();
                 resultFuture.complete(Collections.singleton(input));
                 return;
@@ -129,12 +126,11 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
 
                             // 同时设置到 data 数组中的每个 pr 对象
                             Object dataListObj = data.get("data");
-                            if (dataListObj instanceof JSONArray) {
-                                JSONArray dataArray = (JSONArray) dataListObj;
-                                for (int i = 0; i < dataArray.size(); i++) {
-                                    JSONObject item = dataArray.getJSONObject(i);
+                            if (dataListObj instanceof List) {
+                                List<Map<String, Object>> dataArray = (List<Map<String, Object>>) dataListObj;
+                                for (Map<String, Object> item : dataArray) {
                                     if (item != null) {
-                                        JSONObject pr = item.getJSONObject("pr");
+                                        Map<String, Object> pr = (Map<String, Object>) item.get("pr");
                                         if (pr != null) {
                                             pr.put("$zg_did", zgDeviceId);
                                         }
@@ -143,8 +139,8 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
                             }
 
                             Boolean isNew = oneIdResult.getIsNew();
-                            if(isNew){ // 本并行度生成的新 zg_did  进行输出到kafka
-                                archiveKafkaService.sendToKafka(ArchiveType.DEVICE,appId,did,zgDeviceId);
+                            if (isNew) {
+                                archiveKafkaService.sendToKafka(ArchiveType.DEVICE, appId, did, zgDeviceId);
                             }
                             metrics.out();
                         } else {
@@ -180,8 +176,6 @@ public class DeviceIdAsyncOperator extends RichAsyncFunction<ZGMessage, ZGMessag
         if (metrics != null) {
             metrics.shutdown();
         }
-        // 注意: 不要在这里关闭 oneIdService，因为它是由 CacheServiceFactory 管理的单例
         LOG.info("[DeviceIdAsyncOperator-{}] 关闭", getRuntimeContext().getIndexOfThisSubtask());
     }
-
 }

@@ -182,15 +182,8 @@ public class LockManager {
     /**
      * 创建事件属性锁的key
      */
-    public static String eventAttrLockKey(Integer eventId, String owner, String attrName) {
-        return "event_attr:" + eventId + "_" + owner + "_" + attrName;
-    }
-
-    /**
-     * 创建用户属性锁的key
-     */
-    public static String userPropLockKey(Integer appId, String owner, String propName) {
-        return "user_prop:" + appId + "_" + owner + "_" + propName;
+    public static String eventAttrLockKey(Integer eventId, String owner) {
+        return "event_attr:" + eventId + "_" + owner;
     }
 
     /**

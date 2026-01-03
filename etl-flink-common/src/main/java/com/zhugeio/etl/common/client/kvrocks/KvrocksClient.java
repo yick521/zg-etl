@@ -2,11 +2,9 @@ package com.zhugeio.etl.common.client.kvrocks;
 
 import io.lettuce.core.*;
 import io.lettuce.core.api.StatefulRedisConnection;
-import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.cluster.ClusterClientOptions;
 import io.lettuce.core.cluster.RedisClusterClient;
 import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
-import io.lettuce.core.cluster.api.async.RedisAdvancedClusterAsyncCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -419,6 +417,38 @@ public class KvrocksClient implements Serializable {
     }
 
     // ==================== Hash 操作 ====================
+
+    /**
+     * 异步批量 HSET (使用 HSET 命令批量设置多个字段)
+     */
+    public CompletableFuture<Void> asyncHMSet(String key, Map<String, String> map) {
+        if (map == null || map.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+
+        try {
+            if (isCluster) {
+                return getClusterConnection().async().hset(key, map)
+                        .toCompletableFuture()
+                        .thenApply(result -> (Void) null)
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks HMSET失败: {}, size={}, {}", key, map.size(), ex.getMessage());
+                            return null;
+                        });
+            } else {
+                return getStandaloneConnection().async().hset(key, map)
+                        .toCompletableFuture()
+                        .thenApply(result -> (Void) null)
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks HMSET失败: {}, size={}, {}", key, map.size(), ex.getMessage());
+                            return null;
+                        });
+            }
+        } catch (Exception e) {
+            LOG.error("KVRocks HMSET异常: {}", key, e);
+            return CompletableFuture.completedFuture(null);
+        }
+    }
 
     /**
      * 异步 HGET

@@ -6,9 +6,7 @@ import org.everit.json.schema.loader.SchemaLoader;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -16,28 +14,136 @@ import java.util.List;
 
 /**
  * JSON Schema 验证工具
+ *
+ * 支持从以下位置加载 schema 文件（按优先级）：
+ * 1. 当前工作目录（Flink -yt 上传的文件）
+ * 2. Classpath 资源
  */
 public class Check {
 
-    public static final Schema basicSchema = getSchema("/schema/basicSchema.json");
+    public static final Schema basicSchema = loadBasicSchema();
 
     /**
-     * 从类路径资源加载并编译JSON Schema
+     * 加载基础 Schema
+     * 优先从本地文件加载，回退到 classpath
+     */
+    private static Schema loadBasicSchema() {
+        String classpathPath = "/schema/basicSchema.json";
+        String localPath = "schema/basicSchema.json";
+
+        try {
+            InputStream is = null;
+            String loadedFrom = null;
+
+            // 1. 优先从当前目录读取（Flink -yt 上传的文件）
+            File localFile = new File(localPath);
+            if (localFile.exists()) {
+                is = new FileInputStream(localFile);
+                loadedFrom = "local file: " + localFile.getAbsolutePath();
+            }
+
+            // 2. 尝试从 config 子目录读取
+            if (is == null) {
+                File configFile = new File("config/schema/basicSchema.json");
+                if (configFile.exists()) {
+                    is = new FileInputStream(configFile);
+                    loadedFrom = "config file: " + configFile.getAbsolutePath();
+                }
+            }
+
+            // 3. 回退到 classpath
+            if (is == null) {
+                is = Check.class.getResourceAsStream(classpathPath);
+                if (is != null) {
+                    loadedFrom = "classpath: " + classpathPath;
+                }
+            }
+
+            // 4. 检查是否找到文件
+            if (is == null) {
+                throw new RuntimeException(
+                        "Schema file not found! Searched locations:\n" +
+                                "  1. " + new File(localPath).getAbsolutePath() + "\n" +
+                                "  2. " + new File("config/schema/basicSchema.json").getAbsolutePath() + "\n" +
+                                "  3. classpath:" + classpathPath
+                );
+            }
+
+            System.out.println("[Check] Loading schema from " + loadedFrom);
+
+            // 读取文件内容
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(is, StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+            reader.close();
+            is.close();
+
+            // 解析并编译 Schema
+            JSONObject rawSchema = new JSONObject(new JSONTokener(sb.toString()));
+            Schema schema = SchemaLoader.load(rawSchema);
+
+            System.out.println("[Check] Schema loaded successfully");
+            return schema;
+
+        } catch (Exception e) {
+            System.err.println("[Check] Failed to load schema: " + e.getMessage());
+            e.printStackTrace();
+            throw new RuntimeException("Failed to load basicSchema.json", e);
+        }
+    }
+
+    /**
+     * 从指定路径加载 Schema（保留原方法兼容性）
      *
      * @param schemaPath 资源路径
      * @return 编译好的Schema对象
      */
     public static Schema getSchema(String schemaPath) {
-        try (InputStream is = Check.class.getResourceAsStream(schemaPath);
-             BufferedReader reader = new BufferedReader(
-                     new InputStreamReader(is, StandardCharsets.UTF_8))) {
+        try {
+            InputStream is = null;
 
-            StringBuilder sb = new StringBuilder();
-            String line = reader.readLine();
-            while (line != null) {
-                sb.append(line).append("\n");
-                line = reader.readLine();
+            // 提取文件名
+            String fileName = schemaPath;
+            if (fileName.startsWith("/")) {
+                fileName = fileName.substring(1);
             }
+
+            // 1. 尝试从当前目录读取
+            File localFile = new File(fileName);
+            if (localFile.exists()) {
+                is = new FileInputStream(localFile);
+            }
+
+            // 2. 尝试从 config 目录读取
+            if (is == null) {
+                File configFile = new File("config/" + fileName);
+                if (configFile.exists()) {
+                    is = new FileInputStream(configFile);
+                }
+            }
+
+            // 3. 回退到 classpath
+            if (is == null) {
+                is = Check.class.getResourceAsStream(schemaPath);
+            }
+
+            if (is == null) {
+                throw new RuntimeException("Schema file not found: " + schemaPath);
+            }
+
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(is, StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+            reader.close();
+            is.close();
 
             JSONObject rawSchema = new JSONObject(new JSONTokener(sb.toString()));
             return SchemaLoader.load(rawSchema);

@@ -3,17 +3,11 @@ package com.zhugeio.etl.common.cache;
 /**
  * 缓存 Key 常量定义
  *
- * ⚠️ 重要: 本类定义的 Key 必须与 MySQL→KVRocks 同步服务 (cache-sync) 完全一致
- *
- * 参考: com.zhugeio.cachesync.constants.CacheKeyConstants
  */
 public final class CacheKeyConstants {
 
     private CacheKeyConstants() {}
 
-    // ==========================================================
-    // Hash 类型
-    // ==========================================================
 
     /**
      * appKey → appId 映射
@@ -45,7 +39,7 @@ public final class CacheKeyConstants {
 
     /**
      * 事件 ID 映射
-     * Field: ${appId}_${owner}_${eventName}
+     * Field: ${appId}_${owner}_${eventName} #TODO:${appId}_${owner}_${eventName}_{platform} 同步那里也要加
      * Value: ${eventId}
      */
     public static final String APP_ID_EVENT_ID_MAP = "appIdEventIdMap";
@@ -212,6 +206,25 @@ public final class CacheKeyConstants {
      */
     public static final String BUSINESS_MAP = "businessMap";
 
+
+    /**
+     * appId 到 ip黑名单 ua黑名单的映射
+     * Hash Key:ipBlackMap
+     * Field: ${appId}
+     * Value: ${ip黑名单字符串}
+     * value 格式为 ["a","b"]
+     */
+    public static final String IP_BLACK_MAP = "ipBlackMap";
+
+    /**
+     * appId 到 ip黑名单 ua黑名单的映射
+     * Hash Key:ipBlackMap
+     * Field: ${appId}
+     * Value: ${ua黑名单字符串}
+     * value 格式为 ["a","b"]
+     */
+    public static final String UA_BLACK_MAP = "uaBlackMap";
+
     // ==========================================================
     // 同步元数据
     // ==========================================================
@@ -368,4 +381,5 @@ public final class CacheKeyConstants {
                                              String eventName, String attrName) {
         return appId + "_" + owner + "_" + eventName + "_" + attrName;
     }
+
 }

@@ -256,6 +256,31 @@ public class KvrocksClient implements Serializable {
     }
 
     /**
+     * 异步 GET
+     */
+    public CompletableFuture<Set<String>> asyncSmembers(String key) {
+        try {
+            if (isCluster) {
+                return getClusterConnection().async().smembers(key)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks GET失败: {}, {}", key, ex.getMessage());
+                            return null;
+                        });
+            } else {
+                return getStandaloneConnection().async().smembers(key)
+                        .toCompletableFuture()
+                        .exceptionally(ex -> {
+                            LOG.error("KVRocks GET失败: {}, {}", key, ex.getMessage());
+                            return null;
+                        });
+            }
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    /**
      * 异步 SET
      */
     public CompletableFuture<Void> asyncSet(String key, String value) {

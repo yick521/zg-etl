@@ -18,11 +18,11 @@ public class Config {
     // ============ 原有常量 (保持不变) ============
     public static final String KAFKA_BROKERS = "kafka.brokers";
     public static final String KAFKA_GATE_SOURCE_TOPIC = "kafka.gate.sourceTopic";
-    public static final String KAFKA_DW_SOURCE_TOPIC = "kafka.dw.sourceTopic";
-    public static final String KAFKA_ID_SOURCE_TOPIC = "kafka.id.sourceTopic";
-    public static final String KAFKA_DW_GROUP_ID = "kafka.dw.group.id";
-    public static final String KAFKA_ID_GROUP_ID = "kafka.id.group.id";
     public static final String KAFKA_GATE_GROUP_ID = "kafka.gate.group.id";
+    public static final String KAFKA_ID_SOURCE_TOPIC = "kafka.id.sourceTopic";
+    public static final String KAFKA_ID_GROUP_ID = "kafka.id.group.id";
+    public static final String KAFKA_DW_SOURCE_TOPIC = "kafka.dw.sourceTopic";
+    public static final String KAFKA_DW_GROUP_ID = "kafka.dw.group.id";
     public static final String KAFKA_MAX_PARTITION_FETCH_BYTES = "kafka.max.partition.fetch.bytes";
     public static final String KAFKA_MAX_POLL_RECORDS = "kafka.max.poll.records";
     public static final String KAFKA_FETCH_MAX_WAIT_MS = "kafka.fetch.max.wait.ms";
@@ -78,11 +78,11 @@ public class Config {
 
     // ============ RDBMS (MySQL) 配置 ============
     public static final String RDBMS_URL = "rdbms.url";
-    public static final String RDBMS_USERNAME = "rdbms.username";
+    public static final String RDBMS_USERNAME = "rdbms.userName";
     public static final String RDBMS_PASSWORD = "rdbms.password";
-    public static final String RDBMS_DRIVER = "rdbms.driver";
-    public static final String RDBMS_MAX_POOL_SIZE = "rdbms.max.pool.size";
-    public static final String RDBMS_MIN_IDLE = "rdbms.min.idle";
+    public static final String RDBMS_DRIVER = "rdbms.driverClass";
+    public static final String RDBMS_MAX_POOL_SIZE = "rdbms.maxPoolSize";
+    public static final String RDBMS_MIN_IDLE = "rdbms.minPoolSize";
     public static final String RDBMS_CONNECTION_TIMEOUT = "rdbms.connection.timeout";
 
     // IP 解析
@@ -148,6 +148,13 @@ public class Config {
     public static final String KAFKA_ID_ARCHIVE_GROUP_ID = "kafka.id.archive.group.id";
     public static final String CHECKPOINT_ID_ARCHIVE_PATH = "checkpoint.id.archive.path";
     public static final String INIT_SQL = "init.sql";
+
+    // 广告功能
+    public static final String KAFKA_ADV_SOURCE_TOPIC = "kafka.adv.sourceTopic";
+    public static final String KAFKA_ADV_GROUP_ID = "kafka.adv.group.id";
+    public static final String KAFKA_ADV_USER_SOURCE_TOPIC = "kafka.adv.user.sourceTopic";
+    public static final String ADV_SINK_EVENT_TABLE = "adv.sink.event.table";
+    public static final String ADV_SINK_CLICK_TABLE = "adv.sink.click.table";
 
     /**
      * 数据质量服务开关
@@ -434,11 +441,11 @@ public class Config {
         }
 
         props.setProperty("rdbms.url", url);
-        props.setProperty("rdbms.username", getString(RDBMS_USERNAME, "root"));
+        props.setProperty("rdbms.userName", getString(RDBMS_USERNAME, "root"));
         props.setProperty("rdbms.password", getString(RDBMS_PASSWORD, ""));
-        props.setProperty("rdbms.driver", getString(RDBMS_DRIVER, "com.mysql.cj.jdbc.Driver"));
-        props.setProperty("rdbms.max.pool.size", getString(RDBMS_MAX_POOL_SIZE, "10"));
-        props.setProperty("rdbms.min.idle", getString(RDBMS_MIN_IDLE, "2"));
+        props.setProperty("rdbms.driverClass", getString(RDBMS_DRIVER, "com.mysql.cj.jdbc.Driver"));
+        props.setProperty("rdbms.maxPoolSize", getString(RDBMS_MAX_POOL_SIZE, "10"));
+        props.setProperty("rdbms.minPoolSize", getString(RDBMS_MIN_IDLE, "2"));
         props.setProperty("rdbms.connection.timeout", getString(RDBMS_CONNECTION_TIMEOUT, "30000"));
 
         // 也复制 maxPropLength 配置

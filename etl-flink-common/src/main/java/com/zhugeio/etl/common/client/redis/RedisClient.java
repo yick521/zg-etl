@@ -24,11 +24,11 @@ import java.util.stream.Collectors;
 /**
  * Redis客户端 - Lettuce真异步版本 + 分布式原子操作支持
  *
- * ✅ 优势:
+ *  优势:
  * 1. 真正的异步IO,基于Netty
  * 2. 无需线程池,不会阻塞
  * 3. 支持百万级并发
- * 4. ✅ 新增: SETNX/HSETNX 原子操作,解决分布式并发问题
+ * 4.  新增: SETNX/HSETNX 原子操作,解决分布式并发问题
  */
 public class RedisClient implements Serializable {
 
@@ -98,12 +98,12 @@ public class RedisClient implements Serializable {
 
             standaloneConnection = standaloneClient.connect();
 
-            LOG.info("✅ Lettuce单机连接初始化成功：{}:{} (真异步模式)", host, port);
+            LOG.info(" Lettuce单机连接初始化成功：{}:{} (真异步模式)", host, port);
         }
     }
 
     /**
-     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     *  真正的异步Get操作 (基于Netty,无阻塞)
      */
     public CompletableFuture<String> asyncGet(String key) {
         try {
@@ -133,7 +133,7 @@ public class RedisClient implements Serializable {
 
 
     /**
-     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     *  真正的异步Get操作 (基于Netty,无阻塞)
      * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
      */
     public CompletableFuture<List<KeyValue<String, String>>> asyncMGet(String...keys) {
@@ -163,7 +163,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     *  真正的异步Get操作 (基于Netty,无阻塞)
      * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
      */
     public List<KeyValue<String, String>> syncMGet(String...keys) {
@@ -180,7 +180,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 真正的异步Get操作 (基于Netty,无阻塞)
+     *  真正的异步Get操作 (基于Netty,无阻塞)
      * List<KeyValue<String, String>> 返回数量和入参一致， 顺序一致，若不存在value为null
      */
     public String syncGet(String keys) {
@@ -197,7 +197,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 真正的异步del操作 (基于Netty,无阻塞)
+     *  真正的异步del操作 (基于Netty,无阻塞)
      */
     public CompletableFuture<Long> asyncDel(String...keys) {
         try {
@@ -242,7 +242,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 真正的异步Set操作 (修复类型转换)
+     *  真正的异步Set操作 (修复类型转换)
      */
     public CompletableFuture<Void> asyncSet(String key, String value) {
         try {
@@ -297,7 +297,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 原子性的 SETNX (SET if Not eXists)
+     *  原子性的 SETNX (SET if Not eXists)
      * 只在key不存在时设置值
      *
      * @return true表示设置成功(之前不存在), false表示key已存在
@@ -330,7 +330,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 异步Hash Get
+     *  异步Hash Get
      */
     public CompletableFuture<String> asyncHGet(String key, String field) {
         try {
@@ -361,7 +361,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 异步Hash Set (修复类型转换)
+     *  异步Hash Set (修复类型转换)
      */
     public CompletableFuture<Void> asyncHSet(String key, String field, String value) {
         try {
@@ -382,7 +382,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 原子性的 HSETNX (Hash SET if Not eXists)
+     *  原子性的 HSETNX (Hash SET if Not eXists)
      * 只在hash的field不存在时设置值
      *
      * @return true表示设置成功(field之前不存在), false表示field已存在
@@ -411,7 +411,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 批量Hash Get (真正的Pipeline)
+     *  批量Hash Get (真正的Pipeline)
      */
     public CompletableFuture<Map<String, String>> asyncBatchHGet(String key, List<String> fields) {
         try {
@@ -477,7 +477,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 批量Hash Set (修复类型转换)
+     *  批量Hash Set (修复类型转换)
      */
     public CompletableFuture<Void> asyncBatchHSet(String key, Map<String, String> fieldValues) {
         try {
@@ -536,7 +536,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 同步批量管道查询 (Window算子专用)
+     *  同步批量管道查询 (Window算子专用)
      */
     public Map<String, String> syncBatchHGet(String hashKey, List<String> fields, long timeoutMs) {
         Map<String, String> results = new HashMap<>();
@@ -602,7 +602,7 @@ public class RedisClient implements Serializable {
     }
 
     /**
-     * ✅ 同步批量管道写入 (Window算子专用)
+     *  同步批量管道写入 (Window算子专用)
      */
     public void syncBatchHSet(String hashKey, Map<String, String> fieldValues, long timeoutMs) {
         if (fieldValues == null || fieldValues.isEmpty()) {

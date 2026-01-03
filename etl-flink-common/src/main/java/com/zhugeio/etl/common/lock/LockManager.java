@@ -192,4 +192,11 @@ public class LockManager {
     public static String userPropLockKey(Integer appId, String owner, String propName) {
         return "user_prop:" + appId + "_" + owner + "_" + propName;
     }
+
+    /**
+     * 创建AppId和平台的锁key
+     */
+    public String appSdkLockKey(Integer appId, Integer platform) {
+        return "app_sdk:" + appId + "_" + platform;
+    }
 }

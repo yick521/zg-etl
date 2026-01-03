@@ -1,64 +1,42 @@
 package com.zhugeio.etl.common.metrics;
 
+import org.apache.flink.dropwizard.metrics.DropwizardHistogramWrapper;
 import org.apache.flink.metrics.Counter;
 import org.apache.flink.metrics.Gauge;
+import org.apache.flink.metrics.Histogram;
+import org.apache.flink.metrics.Meter;
 import org.apache.flink.metrics.MeterView;
 import org.apache.flink.metrics.MetricGroup;
+
+import com.codahale.metrics.SlidingTimeWindowReservoir;
 
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 算子级 Metrics (增强版 - 支持定时打印)
- *
- * 核心指标:
- * - in: 输入数据量
- * - out: 输出数据量 (处理成功)
- * - error: 处理异常数
- * - skip: 跳过数 (数据不需要处理)
- * - cacheHitRate: 缓存命中率
- * - latency: 处理耗时 (滑动窗口，最近 N 条的平均)
- *
- * 定时打印功能:
- * - 每隔指定时间打印一次 QPS、延迟、缓存命中率等指标
- * - 默认 60 秒打印一次
+ * 算子级 Metrics
  *
  * 使用:
  * <pre>
- * // open() 中 - 启用定时打印 (每60秒)
+ * // open()
  * metrics = OperatorMetrics.create(getRuntimeContext().getMetricGroup(), "ua_enrich", 60);
  *
- * // 或者不启用定时打印
- * metrics = OperatorMetrics.create(getRuntimeContext().getMetricGroup(), "ua_enrich");
- *
- * // 处理逻辑中
- * metrics.in();  // 开始计时
- *
+ * // 处理逻辑
+ * metrics.in();
  * try {
- *     if (data.get("ua") == null) {
- *         metrics.skip();
- *         return message;
- *     }
- *
- *     if (cache.get(ua) != null) {
- *         metrics.cacheHit();
- *     } else {
- *         metrics.cacheMiss();
- *     }
- *
- *     metrics.out();  // 成功，自动计算耗时
+ *     if (skipCondition) { metrics.skip(); return; }
+ *     if (cacheHit) { metrics.cacheHit(); } else { metrics.cacheMiss(); }
+ *     metrics.out();
  * } catch (Exception e) {
- *     metrics.error();  // 失败，自动计算耗时
+ *     metrics.error();
  * }
  *
- * // close() 中
+ * // close()
  * metrics.shutdown();
  * </pre>
  */
@@ -68,290 +46,170 @@ public class OperatorMetrics {
 
     private final String name;
 
-    // 核心计数
-    private final LongAdder inCount = new LongAdder();
-    private final LongAdder outCount = new LongAdder();
-    private final LongAdder errorCount = new LongAdder();
-    private final LongAdder skipCount = new LongAdder();
+    // ========== Flink Metrics ==========
+    private Counter inCounter;
+    private Counter outCounter;
+    private Counter errorCounter;
+    private Counter skipCounter;
+    private Counter cacheHitCounter;
+    private Counter cacheMissCounter;
 
-    // 缓存统计
-    private final LongAdder cacheHitCount = new LongAdder();
-    private final LongAdder cacheMissCount = new LongAdder();
+    private Meter inMeter;
+    private Meter outMeter;
 
-    // 延迟统计 (时间窗口，无锁)
-    private static final int BUCKET_COUNT = 60;
-    private final LongAdder[] bucketSum = new LongAdder[BUCKET_COUNT];
-    private final LongAdder[] bucketCount = new LongAdder[BUCKET_COUNT];
-    private final AtomicLong lastBucketTime = new AtomicLong(0);
-    private final AtomicLong latencyMax = new AtomicLong(0);
+    // 延迟统计 - 使用 Dropwizard Histogram
+    private Histogram latencyHistogram;
 
-    // 每个线程记录自己的开始时间
+    // 记录每个线程的开始时间
     private final ThreadLocal<Long> startTime = new ThreadLocal<>();
 
-    private Counter flinkInCounter;
-
-    // ========== 定时打印相关 ==========
+    // ========== 定时打印 ==========
     private ScheduledExecutorService scheduler;
     private ScheduledFuture<?> printTask;
     private final int printIntervalSeconds;
 
-    // 上次打印时的计数，用于计算区间 QPS
-    private long lastPrintIn = 0;
-    private long lastPrintOut = 0;
-    private long lastPrintError = 0;
-    private long lastPrintSkip = 0;
-    private long lastPrintTime = System.currentTimeMillis();
-
-    /**
-     * 私有构造函数
-     * @param name 指标名称
-     * @param printIntervalSeconds 打印间隔秒数，<=0 表示不打印
-     */
     private OperatorMetrics(String name, int printIntervalSeconds) {
         this.name = name;
         this.printIntervalSeconds = printIntervalSeconds;
-
-        // 初始化桶
-        for (int i = 0; i < BUCKET_COUNT; i++) {
-            bucketSum[i] = new LongAdder();
-            bucketCount[i] = new LongAdder();
-        }
     }
 
-    /**
-     * 创建 Metrics (不启用定时打印)
-     */
     public static OperatorMetrics create(MetricGroup metricGroup, String name) {
         return create(metricGroup, name, 0);
     }
 
-    /**
-     * 创建 Metrics (启用定时打印)
-     * @param metricGroup Flink MetricGroup
-     * @param name 指标名称
-     * @param printIntervalSeconds 打印间隔秒数，<=0 表示不打印
-     */
     public static OperatorMetrics create(MetricGroup metricGroup, String name, int printIntervalSeconds) {
         OperatorMetrics m = new OperatorMetrics(name, printIntervalSeconds);
         m.register(metricGroup);
-
         if (printIntervalSeconds > 0) {
             m.startPrintTask();
         }
-
         return m;
     }
 
     private void register(MetricGroup root) {
-        MetricGroup g = root.addGroup("etl");
+        MetricGroup g = root.addGroup("etl").addGroup(name);
 
-        flinkInCounter = g.counter("in");
-        g.gauge("out", (Gauge<Long>) outCount::sum);
-        g.gauge("error", (Gauge<Long>) errorCount::sum);
-        g.gauge("skip", (Gauge<Long>) skipCount::sum);
+        // Counter
+        inCounter = g.counter("in");
+        outCounter = g.counter("out");
+        errorCounter = g.counter("error");
+        skipCounter = g.counter("skip");
+        cacheHitCounter = g.counter("cache_hit");
+        cacheMissCounter = g.counter("cache_miss");
 
-        g.meter("qps", new MeterView(flinkInCounter, 60));
+        // Meter (60秒滑动窗口)
+        inMeter = g.meter("in_qps", new MeterView(inCounter, 60));
+        outMeter = g.meter("out_qps", new MeterView(outCounter, 60));
 
-        g.gauge("cache_hit_rate", (Gauge<Double>) () -> {
-            long hits = cacheHitCount.sum();
-            long total = hits + cacheMissCount.sum();
-            return total == 0 ? 0.0 : (double) hits / total * 100;
-        });
+        // Histogram (60秒滑动窗口)
+        com.codahale.metrics.Histogram dropwizardHistogram = new com.codahale.metrics.Histogram(
+                new SlidingTimeWindowReservoir(60, TimeUnit.SECONDS)
+        );
+        latencyHistogram = g.histogram("latency", new DropwizardHistogramWrapper(dropwizardHistogram));
 
-        g.gauge("latency_avg_ms", (Gauge<Double>) this::calcAvgLatency);
-        g.gauge("latency_max_ms", (Gauge<Long>) latencyMax::get);
+        // Gauge - 缓存命中率
+        g.gauge("cache_hit_rate", (Gauge<Double>) this::getCacheHitRate);
     }
 
-    /**
-     * 启动定时打印任务
-     */
+    // ========== 核心方法 ==========
+
+    public void in() {
+        inCounter.inc();
+        startTime.set(System.currentTimeMillis());
+    }
+
+    public void out() {
+        outCounter.inc();
+        recordLatency();
+    }
+
+    public void error() {
+        errorCounter.inc();
+        recordLatency();
+    }
+
+    public void skip() {
+        skipCounter.inc();
+    }
+
+    public void cacheHit() {
+        cacheHitCounter.inc();
+    }
+
+    public void cacheMiss() {
+        cacheMissCounter.inc();
+    }
+
+    private void recordLatency() {
+        Long start = startTime.get();
+        if (start != null) {
+            long latencyMs = System.currentTimeMillis() - start;
+            latencyHistogram.update(latencyMs);
+        }
+    }
+
+    // ========== 获取指标 ==========
+
+    public long getIn() { return inCounter.getCount(); }
+    public long getOut() { return outCounter.getCount(); }
+    public long getError() { return errorCounter.getCount(); }
+    public long getSkip() { return skipCounter.getCount(); }
+    public double getInQps() { return inMeter.getRate(); }
+    public double getOutQps() { return outMeter.getRate(); }
+
+    public double getCacheHitRate() {
+        long hits = cacheHitCounter.getCount();
+        long total = hits + cacheMissCounter.getCount();
+        return total == 0 ? 0.0 : (double) hits / total * 100;
+    }
+
+    // 延迟统计
+    public long getLatencyCount() { return latencyHistogram.getCount(); }
+    public double getLatencyMean() { return latencyHistogram.getStatistics().getMean(); }
+    public long getLatencyMin() { return latencyHistogram.getStatistics().getMin(); }
+    public long getLatencyMax() { return latencyHistogram.getStatistics().getMax(); }
+    public double getLatencyP50() { return latencyHistogram.getStatistics().getQuantile(0.50); }
+    public double getLatencyP95() { return latencyHistogram.getStatistics().getQuantile(0.95); }
+    public double getLatencyP99() { return latencyHistogram.getStatistics().getQuantile(0.99); }
+
+    // ========== 定时打印 ==========
+
     private void startPrintTask() {
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "metrics-printer-" + name);
             t.setDaemon(true);
             return t;
         });
-
-        printTask = scheduler.scheduleAtFixedRate(
-                this::printMetrics,
-                printIntervalSeconds,
-                printIntervalSeconds,
-                TimeUnit.SECONDS
-        );
-
-        LOG.info("[{}] 定时打印任务已启动，间隔 {} 秒", name, printIntervalSeconds);
+        printTask = scheduler.scheduleAtFixedRate(this::printMetrics, printIntervalSeconds, printIntervalSeconds, TimeUnit.SECONDS);
+        LOG.info("[{}] 定时打印已启动，间隔 {}s", name, printIntervalSeconds);
     }
 
-    /**
-     * 打印指标
-     */
     private void printMetrics() {
         try {
-            long now = System.currentTimeMillis();
-            long elapsed = now - lastPrintTime;
-            double elapsedSec = elapsed / 1000.0;
-
-            long currentIn = inCount.sum();
-            long currentOut = outCount.sum();
-            long currentError = errorCount.sum();
-            long currentSkip = skipCount.sum();
-
-            // 计算区间增量
-            long deltaIn = currentIn - lastPrintIn;
-            long deltaOut = currentOut - lastPrintOut;
-            long deltaError = currentError - lastPrintError;
-            long deltaSkip = currentSkip - lastPrintSkip;
-
-            // 计算 QPS (区间内的每秒处理数)
-            double qpsIn = elapsedSec > 0 ? deltaIn / elapsedSec : 0;
-            double qpsOut = elapsedSec > 0 ? deltaOut / elapsedSec : 0;
-
-            // 缓存命中率
-            double cacheHitRate = getCacheHitRate();
-
-            // 延迟
-            double avgLatency = calcAvgLatency();
-            long maxLatency = latencyMax.get();
-
-            LOG.info("╔════════════════════════════════════════════════════════════╗");
-            LOG.info("║  [{}] 性能指标报告", name);
-            LOG.info("╠════════════════════════════════════════════════════════════╣");
-            LOG.info("║  时间窗口: {} 秒", String.format("%.1f", elapsedSec));
-            LOG.info("╠════════════════════════════════════════════════════════════╣");
-            LOG.info("║  吞吐量:");
-            LOG.info("║    输入 QPS: {} /s (本次 +{})", String.format("%,.0f", qpsIn), deltaIn);
-            LOG.info("║    输出 QPS: {} /s (本次 +{})", String.format("%,.0f", qpsOut), deltaOut);
-            LOG.info("║    错误数: {} (本次 +{})", currentError, deltaError);
-            LOG.info("║    跳过数: {} (本次 +{})", currentSkip, deltaSkip);
-            LOG.info("╠════════════════════════════════════════════════════════════╣");
-            LOG.info("║  延迟:");
-            LOG.info("║    平均延迟: {} ms", String.format("%.2f", avgLatency));
-            LOG.info("║    最大延迟: {} ms", maxLatency);
-            LOG.info("╠════════════════════════════════════════════════════════════╣");
-            LOG.info("║  缓存:");
-            LOG.info("║    命中率: {}%", String.format("%.2f", cacheHitRate));
-            LOG.info("║    命中: {}, 未命中: {}", cacheHitCount.sum(), cacheMissCount.sum());
-            LOG.info("╠════════════════════════════════════════════════════════════╣");
-            LOG.info("║  累计: in={}, out={}, error={}, skip={}",
-                    currentIn, currentOut, currentError, currentSkip);
-            LOG.info("╚════════════════════════════════════════════════════════════╝");
-
-            // 更新上次打印的值
-            lastPrintIn = currentIn;
-            lastPrintOut = currentOut;
-            lastPrintError = currentError;
-            lastPrintSkip = currentSkip;
-            lastPrintTime = now;
-
+            LOG.info("┌──────────────────────────────────────────────────────────┐");
+            LOG.info("│ [{}] 指标报告", name);
+            LOG.info("├──────────────────────────────────────────────────────────┤");
+            LOG.info("│ 吞吐: in={} ({}/s), out={} ({}/s)",
+                    getIn(), fmt(getInQps()), getOut(), fmt(getOutQps()));
+            LOG.info("│ 状态: error={}, skip={}", getError(), getSkip());
+            LOG.info("├──────────────────────────────────────────────────────────┤");
+            LOG.info("│ 延迟: avg={}ms, min={}ms, max={}ms",
+                    fmt(getLatencyMean()), getLatencyMin(), getLatencyMax());
+            LOG.info("│       p50={}ms, p95={}ms, p99={}ms",
+                    fmt(getLatencyP50()), fmt(getLatencyP95()), fmt(getLatencyP99()));
+            LOG.info("├──────────────────────────────────────────────────────────┤");
+            LOG.info("│ 缓存: hit={}% ({}/{})",
+                    fmt(getCacheHitRate()), cacheHitCounter.getCount(), cacheMissCounter.getCount());
+            LOG.info("└──────────────────────────────────────────────────────────┘");
         } catch (Exception e) {
-            LOG.warn("打印指标失败", e);
+            LOG.warn("[{}] 打印失败", name, e);
         }
     }
 
-    // ========== 核心方法 ==========
+    private String fmt(double v) { return String.format("%.2f", v); }
 
-    public void in() {
-        inCount.increment();
-        flinkInCounter.inc();
-        startTime.set(System.currentTimeMillis());
-    }
-
-    public void out() {
-        outCount.increment();
-        recordLatency();
-    }
-
-    public void error() {
-        errorCount.increment();
-        recordLatency();
-    }
-
-    public void skip() {
-        skipCount.increment();
-    }
-
-    // ========== 缓存统计 ==========
-
-    public void cacheHit() {
-        cacheHitCount.increment();
-    }
-
-    public void cacheMiss() {
-        cacheMissCount.increment();
-    }
-
-    // ========== 内部方法 ==========
-
-    private void recordLatency() {
-        Long start = startTime.get();
-        if (start == null) return;
-
-        long latencyMs = System.currentTimeMillis() - start;
-        long nowSec = System.currentTimeMillis() / 1000;
-        int bucket = (int) (nowSec % BUCKET_COUNT);
-
-        // 清理过期桶 (CAS 保证只有一个线程清理)
-        long lastSec = lastBucketTime.get();
-        if (nowSec > lastSec && lastBucketTime.compareAndSet(lastSec, nowSec)) {
-            for (long s = lastSec + 1; s <= nowSec && s <= lastSec + BUCKET_COUNT; s++) {
-                int b = (int) (s % BUCKET_COUNT);
-                bucketSum[b].reset();
-                bucketCount[b].reset();
-            }
-        }
-
-        // 写入当前桶 (无锁)
-        bucketSum[bucket].add(latencyMs);
-        bucketCount[bucket].increment();
-
-        // 更新最大值
-        long max = latencyMax.get();
-        while (latencyMs > max) {
-            if (latencyMax.compareAndSet(max, latencyMs)) break;
-            max = latencyMax.get();
-        }
-    }
-
-    private double calcAvgLatency() {
-        long totalSum = 0;
-        long totalCount = 0;
-
-        for (int i = 0; i < BUCKET_COUNT; i++) {
-            totalSum += bucketSum[i].sum();
-            totalCount += bucketCount[i].sum();
-        }
-
-        return totalCount == 0 ? 0.0 : (double) totalSum / totalCount;
-    }
-
-    // ========== 获取统计值 ==========
-
-    public long getIn() { return inCount.sum(); }
-    public long getOut() { return outCount.sum(); }
-    public long getError() { return errorCount.sum(); }
-    public long getSkip() { return skipCount.sum(); }
-
-    public double getCacheHitRate() {
-        long hits = cacheHitCount.sum();
-        long total = hits + cacheMissCount.sum();
-        return total == 0 ? 0.0 : (double) hits / total * 100;
-    }
-
-    public double getAvgLatency() {
-        return calcAvgLatency();
-    }
-
-    public long getMaxLatency() {
-        return latencyMax.get();
-    }
-
-    /**
-     * 关闭定时任务 - 必须在算子 close() 时调用
-     */
     public void shutdown() {
-        if (printTask != null) {
-            printTask.cancel(false);
-        }
+        if (printTask != null) printTask.cancel(false);
         if (scheduler != null) {
             scheduler.shutdown();
             try {
@@ -363,11 +221,8 @@ public class OperatorMetrics {
                 Thread.currentThread().interrupt();
             }
         }
-
-        // 最后打印一次汇总
-        LOG.info("[{}] 最终统计: in={}, out={}, error={}, skip={}, cacheHitRate={}%, avgLatency={}ms",
+        LOG.info("[{}] 最终: in={}, out={}, error={}, skip={}, cacheHit={}%, latency(avg={}ms, p99={}ms)",
                 name, getIn(), getOut(), getError(), getSkip(),
-                String.format("%.2f", getCacheHitRate()),
-                String.format("%.2f", getAvgLatency()));
+                fmt(getCacheHitRate()), fmt(getLatencyMean()), fmt(getLatencyP99()));
     }
 }

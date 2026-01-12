@@ -1,0 +1,204 @@
+package com.zhugeio.etl.pipeline.transfer;
+
+import com.zhugeio.etl.common.cache.ConfigCacheService;
+import com.zhugeio.etl.common.model.UserPropertyRow;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Serializable;
+import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * 用户属性转换器
+ *
+ * 重构说明:
+ * - transferFromMap() 改为 transferFromMapAsync()，返回 CompletableFuture
+ * - 内部不再使用 .join() 阻塞
+ * - isCdpEnabled 查询改为异步
+ */
+public class UserPropertyTransfer implements Serializable {
+
+    private static final long serialVersionUID = 2L;
+    private static final Logger LOG = LoggerFactory.getLogger(UserPropertyTransfer.class);
+
+    private static final String NULL_VALUE = "\\N";
+    private static final String APP_USER_ID_PROPERTY_ID = "-1";
+    private static final String APP_USER_ID_PROPERTY_NAME = "app_user_id";
+    private static final String APP_USER_ID_DATA_TYPE = "string";
+
+    private final ConfigCacheService configCacheService;
+
+    private static final ThreadLocal<SimpleDateFormat> DATE_FORMAT =
+            ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
+
+    public UserPropertyTransfer(ConfigCacheService configCacheService) {
+        this.configCacheService = configCacheService;
+    }
+
+    /**
+     * 转换用户属性数据
+     *
+     * @return CompletableFuture<List<UserPropertyRow>>
+     */
+    public CompletableFuture<List<UserPropertyRow>> transferFromMapAsync(Integer appId, Integer platform, Map<String, Object> pr) {
+
+        if (pr == null || appId == null) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        String zgId = getStringValue(pr, "$zg_zgid");
+        String userId = getStringValue(pr, "$zg_uid");
+
+        if (isNullOrEmpty(zgId) || isNullOrEmpty(userId)) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        Long ct = getLongValue(pr, "$ct");
+        Integer tz = getIntValue(pr, "$tz");
+
+        if (ct == null || tz == null) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        String time = timestampToDateString(ct, tz);
+        if (isNullOrEmpty(time)) {
+            return CompletableFuture.completedFuture(new ArrayList<>());
+        }
+
+        long timestamp = Timestamp.valueOf(time).getTime() / 1000;
+
+        // ★★★ 异步查询 CDP 状态，不阻塞 ★★★
+        return isCdpEnabledAsync(appId)
+                .thenApply(cdpMode -> {
+                    List<UserPropertyRow> result = new ArrayList<>();
+
+                    // 处理自定义属性 (以 "_" 开头)
+                    for (String key : pr.keySet()) {
+                        if (key.startsWith("_")) {
+                            UserPropertyRow row = processCustomPropertyFromMap(appId, platform, pr, key,
+                                    zgId, userId, timestamp, cdpMode);
+                            if (row != null) {
+                                result.add(row);
+                            }
+                        }
+                    }
+
+                    // 处理 app_user_id ($cuid)
+                    String cuid = getStringValue(pr, "$cuid");
+                    if (!isNullOrEmpty(cuid)) {
+                        UserPropertyRow row = processAppUserId(appId, platform, zgId, userId,
+                                cuid, timestamp, cdpMode);
+                        result.add(row);
+                    }
+
+                    return result;
+                })
+                .exceptionally(ex -> {
+                    LOG.warn("转换用户属性失败: appId={}", appId, ex);
+                    return new ArrayList<>();
+                });
+    }
+
+    /**
+     * 异步检查应用是否开启 CDP
+     */
+    private CompletableFuture<Boolean> isCdpEnabledAsync(Integer appId) {
+        if (configCacheService == null) {
+            return CompletableFuture.completedFuture(false);
+        }
+        return configCacheService.isCdpEnabled(appId)
+                .thenApply(result -> result != null && result)
+                .exceptionally(ex -> {
+                    LOG.warn("检查CDP状态失败: appId={}", appId, ex);
+                    return false;
+                });
+    }
+
+    private UserPropertyRow processCustomPropertyFromMap(Integer appId, Integer platform, Map<String, Object> pr,
+                                                         String propKey, String zgId, String userId,
+                                                         long timestamp, boolean cdpMode) {
+        String propIdKey = "$zg_upid#" + propKey;
+        String propId = getStringValue(pr, propIdKey);
+
+        if (isNullOrEmpty(propId)) {
+            return null;
+        }
+
+        String propName = ensureLength(propKey.substring(1), 256);
+        String propValue = ensureLength(getStringValue(pr, propKey), 256);
+
+        String propTypeKey = "$zg_uptp#" + propKey;
+        String propType = ensureLength(getStringValue(pr, propTypeKey), 256);
+
+        UserPropertyRow row = new UserPropertyRow(appId, cdpMode);
+        row.setZgId(zgId);
+        row.setPropertyId(propId);
+        row.setUserId(userId);
+        row.setPropertyName(propName);
+        row.setPropertyDataType(propType);
+        row.setPropertyValue(propValue);
+        row.setPlatform(platform);
+        row.setLastUpdateDate(timestamp);
+
+        return row;
+    }
+
+    private UserPropertyRow processAppUserId(Integer appId, Integer platform, String zgId,
+                                             String userId, String cuid, long timestamp,
+                                             boolean cdpMode) {
+        UserPropertyRow row = new UserPropertyRow(appId, cdpMode);
+        row.setZgId(zgId);
+        row.setPropertyId(APP_USER_ID_PROPERTY_ID);
+        row.setUserId(userId);
+        row.setPropertyName(APP_USER_ID_PROPERTY_NAME);
+        row.setPropertyDataType(APP_USER_ID_DATA_TYPE);
+        row.setPropertyValue(ensureLength(cuid, 256));
+        row.setPlatform(platform);
+        row.setLastUpdateDate(timestamp);
+        return row;
+    }
+
+    private String timestampToDateString(Long ct, Integer tz) {
+        if (ct == null || tz == null) { return NULL_VALUE; }
+        if (Math.abs(tz) > 48 * 3600 * 1000) { return NULL_VALUE; }
+        try { return DATE_FORMAT.get().format(ct); }
+        catch (Exception e) { return NULL_VALUE; }
+    }
+
+    private String getStringValue(Map<String, Object> map, String key) {
+        if (map == null || key == null) { return NULL_VALUE; }
+        Object value = map.get(key);
+        return value != null ? String.valueOf(value) : NULL_VALUE;
+    }
+
+    private Long getLongValue(Map<String, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).longValue(); }
+        try { return Long.parseLong(String.valueOf(value)); }
+        catch (NumberFormatException e) { return null; }
+    }
+
+    private Integer getIntValue(Map<String, Object> map, String key) {
+        Object value = map.get(key);
+        if (value == null) { return null; }
+        if (value instanceof Number) { return ((Number) value).intValue(); }
+        try { return Integer.parseInt(String.valueOf(value)); }
+        catch (NumberFormatException e) { return null; }
+    }
+
+    private boolean isNullOrEmpty(String value) {
+        return value == null || value.isEmpty() || NULL_VALUE.equals(value);
+    }
+
+    private String ensureLength(String value, int maxLength) {
+        if (isNullOrEmpty(value)) { return NULL_VALUE; }
+        value = value.replaceAll("[\t\n\r\"\\\\\u0000]", " ").trim();
+        return value.length() > maxLength ? value.substring(0, maxLength) : value;
+    }
+}
